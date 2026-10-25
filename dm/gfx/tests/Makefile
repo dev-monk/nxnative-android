@@ -212,6 +212,12 @@ t_clear_tex: t_clear_tex.m $(MTL_T_DEP)
 check_t_clear_tex: t_clear_tex
 	MTL_DEBUG_LAYER=1 ./t_clear_tex
 run: check_t_clear_tex
+t_sparse_life: t_sparse_life.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_sparse_life.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+.PHONY: check_t_sparse_life
+check_t_sparse_life: t_sparse_life
+	MTL_DEBUG_LAYER=1 ./t_sparse_life
+run: check_t_sparse_life
 t_upgrade_alias: t_upgrade_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upgrade_alias.m $(MTL_T_SRC) $(FW)
 t_stencil_view: t_stencil_view.m $(MTL_T_DEP)

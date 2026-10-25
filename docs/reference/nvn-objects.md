@@ -54,7 +54,7 @@ The game may also write into an NVN object directly, without an NVN call, throug
 
 - **Symptom:** a buffer is created with a null pool right after a scene change.
 - **Cause:** NVN *virtual* memory pools (flag 0x200) have no storage until `nvnMemoryPoolMapVirtual` maps physical pool pages in; if the host returns failure, the game treats the pool as unusable.
-- **Fix:** a virtual pool is aliased onto the physical pool named by `MapVirtual` when all requests share one base (`hle_nvn.c`): Mario maps its single 128 MB virtual pool onto one physical pool in one request, so the host aliases it. Other mappings (true sparse) were then unimplemented; they are now [sparse virtual pools](#sparse-virtual-pools-built-from-separate-physical-pools) (next entry).
+- **Fix:** a virtual pool is aliased onto the physical pool named by `MapVirtual` when all requests share one base (`hle_nvn.c`): Mario maps its single 128 MB virtual pool onto one physical pool in one request, so the host aliases it. Other mappings (true sparse) were then unimplemented; they are now [sparse virtual pools](#sparse-virtual-pools-built-from-separate-physical-pools) (next entry). With the profile key `virtual_pools sparse` every virtual pool is sparse ([Small virtual pools made sparse](#small-virtual-pools-made-sparse-virtual_pools-sparse)).
 - **Note:** a null-pool buffer even with virtual pools working means the game's own heap ran out ([A null-pool buffer from a game heap that ran out](memory.md#a-null-pool-buffer-from-a-game-heap-that-ran-out)).
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (all requests share one base).
 
@@ -72,6 +72,14 @@ The game may also write into an NVN object directly, without an NVN call, throug
 - **Fix:** every request also goes into a 4 KB page table (`vpt_*` in `hle_nvn.c`: the physical page behind each virtual page and the generation of the request that set it). The replay reads a sparse pool's textures through it (`nvn_sparse_copy`, unmapped pages as 0) and uploads one again only when a mapping in its range changed or the CPU wrote a physical page behind it (`nvn_sparse_since`; the physical pools are dirty-tracked). Before that the untracked alias counted as written on every look: 32 textures, 18 MB, were uploaded again every frame, and those with unaliased tails came out magenta. Plain sampled textures in the pool go the same way: [Sampled textures in a sparse pool uploaded through the page table](#sampled-textures-in-a-sparse-pool-uploaded-through-the-page-table).
 - **Note:** requests beyond the reserved range (iOS reserves 1 GB: the buffers stay under 0x20100000 through the opening) are kept in the table only, like unaligned ones: textures can read them, the GPU cannot address them.
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md).
+
+### Small virtual pools made sparse (`virtual_pools sparse`)
+
+- **Symptom:** `[RED] MapVirtual: non-contiguous mapping (true sparse) not implemented` for small virtual pools (128 KB to a few MB), a few hundred times.
+- **Cause:** Unreal's NVN RHI gives each streaming texture a virtual pool of its own (flags 0x2a1, 128 KB to a few MB, over a thousand by the opening) and maps it 64 KB page by page from some twenty physical pools, the first request often for a level past the pool's start. Pools no larger than the application pool keep the alias, so every request after the first that named another place failed.
+- **Fix:** the profile key `virtual_pools sparse` makes every virtual pool sparse (`vpool_reserve` in `hle_nvn.c`; `alias`, the default, keeps the rule above). A sparse pool's reservation, page table and runs are allocated at `MemoryPoolInitialize` and hang off its `pool_t` (`vp`), so the per-texture checks find them without a search; lookups that start from an address binary-search the reservations by base (`vps_find`), and the run list grows as needed. Before, there were at most four sparse pools of 1,024 runs each. The log reports the address space the sparse pools hold reserved, per 64 MB. Copies through any sparse pool are ordered against all other copies (`nvn_sparse_alias`, a binary search of the same list under its lock: these pools come and go).
+- **Note:** a profile key, not the default: Super Mario Bros. Wonder maps its 128 MB virtual pool onto one physical pool in one request, which the alias serves with no reservation, no page table and no conservative copy ordering. Whether every virtual pool can be sparse, which would make the key unnecessary, is not tested on the games that keep the alias: open.
+- **Found on:** [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md): on the Mac, from the opening to the first classroom, up to 0.44 GB of address space reserved over 755 pools.
 
 ### Finalized pools kept alive by residency and the sharing table
 
@@ -262,6 +270,7 @@ Games read this count as a position in their own command memory and size their h
   - [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md): the cave was magenta; the terrain draws sample two 121-layer ASTC 8×8 arrays (42 MB each) filled this way.
   - [FINAL FANTASY TACTICS - The Ivalice Chronicles](../../dm/games/010038B015560000/README.md): the UI reads its textures from `.tex` files the engine loads straight into a `CPU_UNCACHED | GPU_CACHED | COMPRESSIBLE` pool (flags 0xa2): 231 textures by the title screen, no packaged layout, no `WriteTexels`, no copies.
   - [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md): a dialog box sampling 256x256 and 1024x256 textures of format 0x4d; `DM_NVN_TEXINFO=1024x256` showed storage that already held data at first use (226,555 of 262,144 bytes non-zero): no packaged layout, block-linear, in a 1000 MB `CPU_CACHED | GPU_CACHED | COMPRESSIBLE` pool (flags 0xa4). A log of the pool flushes, texture creations and file reads (temporary lines under `DM_NVN_LOG`) showed every `.tex` read into staging buffers (512 KB `ReadFile`s, none into the pool) and the texels copied by the CPU into the texture's storage; only the four linear 1024x64 text textures are flushed, every frame. `main` has no cache maintenance instruction at all.
+  - [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md) (Unreal Engine 4.23): the engine writes the classroom's 256x16 colour-grading LUT from the CPU into an ordinary pool after creating it (block-linear, no packaged layout, no `WriteTexels`). It held its data in guest memory but read 0 on the host, so the tonemapper's LUT came out 0 and the whole picture black; the profile sets both keys.
 
 ### `ReadTexels` from guest memory and textures written after first use
 
@@ -365,6 +374,14 @@ Games read this count as a position in their own command memory and size their h
 - **Symptom:** an abort in device setup when `nvnTexturePoolGetSize` / `nvnSamplerPoolGetSize` returned 0.
 - **Fix:** implemented: `nvnTexturePoolGetSize` / `nvnSamplerPoolGetSize` and their memory pool / offset getters; `nvnCommandBufferFenceSync`, which Unreal's RHI records in its command buffers ([Fence syncs recorded in command buffers](#fence-syncs-recorded-in-command-buffers)); `nvnTextureGetTextureAddress` (pool address + offset, as `nvnMemoryPoolGetBufferAddress`); `nvnCommandBufferGetCommandMemorySize` (used + free, as in NVN; `GetCommandMemoryFree` is what is left in the current segment).
 - **Found on:** [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (the pool getters and `nvnCommandBufferFenceSync`, new with Unreal); [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (Unreal Engine 4.18: `nvnTextureGetTextureAddress`, `nvnCommandBufferGetCommandMemorySize`).
+
+### The sparse tile layout of a texture
+
+- **Symptom:** `[RED] NVN unimplemented function called: nvnTextureBuilderGetSparseTileLayout`, then a 0xffe00000-byte memory pool request and Unreal's out-of-memory abort at boot.
+- **Cause:** Unreal's NVN RHI sizes a sparse texture's mip tail as the storage of all its levels less that of the tiled ones, taking the tiled level count from the layout. The stub wrote nothing, so the count was whatever the stack slot held, past the texture's levels, and the tail came out negative.
+- **Fix:** `nvnTextureBuilderGetSparseTileLayout` and `nvnTextureGetSparseTileLayout` fill the first four ints of `NVNtextureSparseTileLayout` (`nvn.h`: the tiled level count, then a tile's width, height and depth in texels) from the host's layout (`nvn_tex_sparse_tiles` in `nvn_tex.c`: the levels at least one 64 KB tile wide, high and deep; the levels after them form the mip tail). A texture that is not sparse gets 0.
+- **Found on:** [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md) (UE 4.23's NVN RHI, `main+0x3bf439c`, reads only the tiled level count).
+- **Check:** `t_tex`: a 1024×1024 DXT5 sparse texture has 3 tiled levels of 256×256-texel tiles.
 
 ### NVN calls that were red stubs
 

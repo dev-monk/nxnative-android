@@ -248,6 +248,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Reader:** `uepak.py` `inline_shaders` tells such a pak from one with archives by its directory index (cooked packages and no `.ushaderbytecode`; an encrypted index is taken for one with archives), and `shader_split.py` `ue_legacy_jobs` reads it file by file, Zlib and LZ4 blocks decoded in Python (`Pak.read`), so no host runs. `ue_inline_shaders` finds each LZ4 block by its first literals, the record's `LSLG`, with the token and literal length bytes in front of it, and takes it when it decodes to exactly the raw size after the block.
 - **Found on:** [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md): 13,980 unique shaders (1,910 vertex, 11,346 pixel, 694 compute, 30 geometry) from the 3.3 GB pak in 13 s.
 
+### Unreal Engine 4.23 shaders inline in an encrypted version 8 pak
+
+- **How it is stored:** one legacy pak, version 8 (UE 4.22 to 4.24), with Zlib blocks; its index and the `.uasset` files are AES-encrypted. Version 8 has version 11's footer (five compression method names) and the per-file index of the legacy versions (the encoded index came with version 10). There is no shader code archive: the engine's global shaders are in `Engine/GlobalShaderCache-GLSL_SWITCH.bin` and the materials' inline in the cooked packages, as in [Unreal Engine 4.18](#unreal-engine-418-shaders-inline-in-cooked-packages).
+- **Key:** no 32-byte window of `main`'s data holds it. The key callback of `UE_REGISTER_ENCRYPTION_KEY` (`main+0x14180c0`) returns it from two 16-byte literals 0x1460 bytes apart (`adrp`, `adrp`, `ldr q`, `ldr q`, `stp q, q, [x0]`, `ret`); `uepak.py` `find_key` tries such callbacks after the windows (`callback_keys`). The key stays in memory, never printed or written.
+- **Reader:** `uepak.py` reads legacy versions 4 and 8 (`LEGACY`) and skips entries flagged deleted (flag 2, a patch pak's record of a file it removes); `inline_shaders` takes every legacy pak for one with inline shaders. `shader_split.py` `ue_legacy_jobs` gives each job its version's `main`, where `pak_key` finds an encrypted pak's key (the jobs carry the path, never the key), and decodes the Zlib blocks in Python.
+- **Found on:** [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md): 18,558 unique shaders (6,440 vertex, 11,608 pixel, 478 compute, 32 geometry) from its 8.8 GB pak.
+
 ## Control sections and code
 
 ### Code area and control section layout
@@ -738,8 +745,9 @@ shader on a GPU.
 - **Symptom:** the picture bright green and white from some scene on, in runs with pipelines compiled on demand (prewarm lists off or short) and in none with `DM_NVN_PREDICT=0`.
 - **Cause:** after a pipeline miss the replay looks ahead through the rest of the submission, replaying state only, to compile the next pipelines in the background (`pso_predict_rest`). It restored `S`, but `state_op` also sets the scissor, which lives in `R`: the replay went on with the last scissor of the submission until its next `OP_SCISSOR`, so the draws in between were clipped to another pass's rectangle.
 - **Fix:** the scissor is saved and restored with `S`; the fusion probe (`fz_probe_cov2`) already restored all of `R`. Every game.
-- **Found on:** [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md): from Castti's opening flashback and the battlefield of Hikari's opening on.
+- **Found on:** [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md): from Castti's opening flashback and the battlefield of Hikari's opening on. [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md): the naming cutscene green, then white: its sky light capture drew a cube face under the 1×1 scissor of the last level it had cleared, so that face kept the clear's green; comparing each pass's first draw's scissor with the game's last `SetScissor` over 50 frames of the cutscene's load (a pass dump), 3 draws were off before the fix and 0 after.
 - **Check:** found by bisecting with four runs started at once on copies of one save: `DM_NVN_PREDICT=0` fixed it, a look-ahead that compiled nothing did not, and of its parts only the state ops brought it back; four runs green before the fix, four right after it.
+- **Note:** the look-ahead's `state_op` prints `T … bind` lines in a pass dump too, so binds of draws further on in the submission show up among the current draw's lines.
 
 ### GPU frame captures need pipelines built through the device
 

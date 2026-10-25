@@ -10,7 +10,7 @@
 #   (FFRS-Switch.utoc / .ucas, Oodle in 64 KB blocks, not encrypted) as one ShaderCodeLibrary chunk each (the tables) and one ShaderCode chunk per group of shaders, every group Oodle-compressed
 #   on its own (Toc, io_archive). Both layers need the game's decoder, which runs in the Mac host's tool mode (OodleHost); the libraries come out as version 2 archives with every shader decoded.
 # The AES key is in main (Unreal embeds it): the 32-byte window of main's read-only or data segment that decrypts the index start to its mount point ("../../../"; Octopath Traveler 0: one window of
-#   116,287 tried). It is only kept in memory, never printed or written.
+#   116,287 tried), or for a key callback whose halves lie apart (SHIN MEGAMI TENSEI V, callback_keys). It is only kept in memory, never printed or written.
 # Pak footer (version 11, the last 0xdd bytes): encryption key GUID (16), encrypted index flag (u8), magic 0x5A6F12E1, version (u32), index offset (u64), index size (u64), index SHA-1 (20),
 #   5 compression method names (32 bytes each).
 # Index: mount point (FString), entry count (i32), path hash seed (u64), path hash index (i32 flag, then u64 offset, u64 size, SHA-1), full directory index (the same, encrypted like the index),
@@ -148,8 +148,8 @@ class R:
         if n < 0: return self.raw(-2 * n).decode('utf-16-le')[:-1]
         return self.raw(n)[:-1].decode('utf-8', 'replace') if n else ''
 
-LEGACY = (4,)   # legacy pak versions read (the per-file index); 11 has the encoded one
-LEGACY_METHODS = {1: 'Zlib', 2: 'Gzip', 3: 'LZ5', 4: 'Custom'}   # compression flags of a legacy pak (3: DRAGON QUEST XI S's engine, see the header)
+LEGACY = (4, 8)   # legacy pak versions read (the per-file index); 11 has the encoded one
+LEGACY_METHODS = {1: 'Zlib', 2: 'Gzip', 3: 'LZ5', 4: 'Custom'}   # compression flags of a version 4 pak (3: DRAGON QUEST XI S's engine, see the header)
 
 def magic_back(f):
     """(how far from the end the footer's magic is, the pak version): a legacy footer is the last 0x2d bytes (magic 0x2c from the end); version 11's magic is 0xc8 from the end in
@@ -165,25 +165,55 @@ def pak_version(f):
 def footer(f):
     """(encrypted index, index offset, index size, compression method names by number from 1, version)"""
     back, ver = magic_back(f)
-    if ver in LEGACY:
+    if ver not in LEGACY + (11,): raise ValueError(f'pak version {ver}, only {", ".join(map(str, LEGACY))} and 11 are read')
+    if back == 0x2c:   # version 4: no key GUID, compression flags instead of names
         f.seek(-0x2d, 2); ft = f.read(0x2d); ioff, isz = struct.unpack_from('<QQ', ft, 9)
         return ft[0], ioff, isz, [LEGACY_METHODS.get(i, f'flags {i}') for i in range(1, 8)], ver
-    if ver != 11: raise ValueError(f'pak version {ver}, only {", ".join(map(str, LEGACY))} and 11 are read')
+    # version 8 (UE 4.22 to 4.24, SHIN MEGAMI TENSEI V: Zlib only) has version 11's footer, five method names in the last 0xcc bytes, before the encoded index of version 10
     f.seek(-(back + 21), 2); ft = f.read(back + 21); k = 21
     ioff, isz = struct.unpack_from('<QQ', ft, k + 8)
     methods = [ft[k + 44 + 32 * i:k + 76 + 32 * i].rstrip(b'\0').decode('latin1') for i in range(5)]
     return ft[k - 1], ioff, isz, methods, ver
 
+def callback_keys(img, lo):
+    """32-byte constants a function of main's text returns through its argument from two vector literals (adrp, adrp, ldr q, ldr q, stp q, q, [x0], ret): the key callback of
+    UE_REGISTER_ENCRYPTION_KEY as clang builds it in SHIN MEGAMI TENSEI V (UE 4.2x, main+0x14180c0), whose halves are 16-byte literals 0x1460 bytes apart, so no window of the data holds the key"""
+    import re
+    for m in re.finditer(rb'[\x00-\x1f][\x00-\x7f]\x00\xad\xc0\x03\x5f\xd6', img[:lo]):   # stp qA, qB, [x0] then ret
+        at = m.start(); stp = struct.unpack_from('<I', img, at)[0]
+        if at % 4 or stp & 0x3e0: continue
+        page, q = {}, {}
+        for j in range(max(0, at - 32), at, 4):
+            x = struct.unpack_from('<I', img, j)[0]
+            if x & 0x9F000000 == 0x90000000:   # adrp
+                imm = ((x >> 5) & 0x7FFFF) << 2 | (x >> 29) & 3
+                page[x & 31] = (j & ~0xFFF) + ((imm - (1 << 21) if imm & (1 << 20) else imm) << 12)
+            elif x & 0xFFC00000 == 0x3DC00000 and (x >> 5) & 31 in page:   # ldr q, [xN, #imm]
+                a = page[(x >> 5) & 31] + ((x >> 10) & 0xFFF) * 16
+                if 0 <= a <= len(img) - 16: q[x & 31] = img[a:a + 16]   # a literal past the image's data (bss) or before it is no key
+        if stp & 31 in q and stp >> 10 & 31 in q: yield q[stp & 31] + q[stp >> 10 & 31]
+
 def find_key(img, lo, hi, pak):
-    """The AES key among main's 32-byte windows (read-only and data segments, 4-aligned, at least 20 distinct bytes): the one that decrypts the index start to a short mount point"""
+    """The AES key among main's 32-byte windows (read-only and data segments, 4-aligned, at least 20 distinct bytes), else among its key callbacks (callback_keys):
+    the one that decrypts the index start to a short mount point"""
     with open(pak, 'rb') as f:
         _, ioff, _, _, _ = footer(f); f.seek(ioff); blk = f.read(16)
+    def fits(w):
+        d = aes_decrypt(w, blk)
+        return 0 < struct.unpack_from('<i', d)[0] < 512 and d[4:7] == b'../'
     for a in range(lo, hi - 32, 4):
         w = img[a:a + 32]
-        if len(set(w)) < 20: continue
-        d = aes_decrypt(w, blk)
-        if 0 < struct.unpack_from('<i', d)[0] < 512 and d[4:7] == b'../': return w
-    return None
+        if len(set(w)) >= 20 and fits(w): return w
+    return next((w for w in callback_keys(img, lo) if fits(w)), None)
+
+_KEYS = {}
+def pak_key(pak, main_nso):
+    """The key of a pak whose index is encrypted, from the main of its version (find_key, once per main), or None for a pak that needs none"""
+    with open(pak, 'rb') as f: enc = footer(f)[0]
+    if not enc: return None
+    if main_nso not in _KEYS: _KEYS[main_nso] = find_key(*nso_image(main_nso), pak)
+    if _KEYS[main_nso] is None: raise ValueError(f'{pak}: the index is encrypted and no window or key callback of {main_nso} decrypts it')
+    return _KEYS[main_nso]
 
 class Pak:
     def __init__(self, path, key=None):
@@ -200,7 +230,8 @@ class Pak:
                 e, bsz = r.take('<BI'); head = 53 + (4 + 16 * len(blocks) if meth else 0)
                 if self.version < 5: blocks = [(s - off, t - s) for s, t in blocks]
                 else: blocks = [(s, t - s) for s, t in blocks]
-                self.files[name] = dict(off=off, raw=raw, size=size, method=self.methods[meth - 1] if meth else '', encrypted=e, block_size=bsz, blocks=blocks or [(head, size)])
+                if e & 2: continue   # FPakEntry flags: 1 encrypted, 2 deleted (a patch pak's record of a file it removes)
+                self.files[name] = dict(off=off, raw=raw, size=size, method=self.methods[meth - 1] if meth else '', encrypted=e & 1, block_size=bsz, blocks=blocks or [(head, size)])
             return
         r.take('<Q')
         if r.take('<i'): r.take('<QQ'); r.raw(20)   # path hash index (not needed with the full directory index)
@@ -230,7 +261,7 @@ class Pak:
             for _ in range(nblk): s = r.take('<I'); blocks.append((cur, s)); cur += (s + 15) & ~15 if enc else s
         return dict(off=off, raw=raw, size=size, method=self.methods[meth - 1] if meth else '', encrypted=enc, block_size=bsz, blocks=blocks)
     def read(self, path, decode=None):
-        """A file's bytes, block by block (each block holds block_size raw bytes, the last one the rest). Zlib and LZ4 blocks are decoded here (OCTOPATH TRAVELER II: Zlib); any other
+        """A file's bytes, block by block (each block holds block_size raw bytes, the last one the rest). Zlib and LZ4 blocks are decoded here (OCTOPATH TRAVELER II and SHIN MEGAMI TENSEI V: Zlib); any other
         method needs decode(block bytes, raw length) → bytes: the game's own decoder in the Mac host (shader_split.py oodle); Octopath Traveler 0's archives go through the Oodle job instead"""
         e = self.entry(path)
         if not e['method']: return self.read_at(e['off'] + 53, e['size'], e['encrypted'])

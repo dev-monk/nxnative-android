@@ -18,7 +18,8 @@ FITS(queue_builder_t, NVNqueueBuilder);
 typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;                 FITS(queue_t, NVNqueue);
 
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
-typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; } pool_t;                FITS(pool_t, NVNmemoryPool);
+struct vpool;   // a sparse virtual pool's address range and page table (hle_nvn.c, see MapVirtual); NULL for any other pool
+typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; struct vpool *vp; } pool_t;   FITS(pool_t, NVNmemoryPool);
 
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
@@ -34,7 +35,9 @@ typedef struct {
 // the former 0x88 wrote past the object's end and corrupted the adjacent heap block's free list. has_layout sits in the alignment gap after d, layout and serial fill up to 0x80.
 typedef struct {
     // set_swz / stencil / swz (as in tex_builder_t) take the alignment gap after d; the size is still 0x80
-    uint32_t magic; nvn_texdesc d; uint8_t has_layout, set_swz : 1, stencil : 1; uint16_t swz; nvn_texlayout L; uint8_t *mem; pool_t *pool; int64_t off; uint8_t layout[8];
+    // sparse: its pool was a sparse virtual pool at TextureInitialize. A sampled one (packaged, nvn_mtl.m) is then read only through that pool's page table, found from mem - off
+    // and serial (hle_nvn.c vpool_tex), also once the game has finalized the pool (its address range is then unmapped, and reading it directly would fault)
+    uint32_t magic; nvn_texdesc d; uint8_t has_layout, set_swz : 1, stencil : 1, sparse : 1; uint16_t swz; nvn_texlayout L; uint8_t *mem; pool_t *pool; int64_t off; uint8_t layout[8];
     uint64_t serial;                     // Initialization serial: the replay layer uses it to find the MTLTexture in the host table (the game may copy the object by value, so object pointers cannot be stored)
 } tex_t;                                                                                     FITS(tex_t, NVNtexture);
 _Static_assert(sizeof(tex_t) <= 0x80, "tex_t exceeds the newer SDKs' NVNtexture (0x80)");

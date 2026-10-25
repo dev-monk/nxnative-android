@@ -53,9 +53,11 @@ typedef struct {
     char reserved[0x40];
 } NVNdeviceBuilder;
 
+// The first four ints; whatever follows is never written. SHIN MEGAMI TENSEI V (UE 4.2x's NVN RHI, main+0x3bf439c) reads only the tiled level count, as the levels whose
+// size it keeps apart from the mip tail
 typedef struct {
-    // TODO: reverse and define this as it looks like it's not an opaque type.
-    char dummy[1];
+    int numTiledLevels;
+    int tileWidth, tileHeight, tileDepth;
 } NVNtextureSparseTileLayout;
 
 typedef struct {

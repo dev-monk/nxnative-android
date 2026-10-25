@@ -194,10 +194,10 @@ NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 
 NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
-static uint8_t *vpool_reserve(const pool_t *o); static void vpool_release(const pool_t *o);   // sparse virtual pools, see MapVirtual
+static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o); int nvn_sparse_tex(const void *pool, uint64_t a, uint64_t serial);   // sparse virtual pools, see MapVirtual
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
-    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
+    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL;
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a sparse virtual pool's own address range (see MapVirtual)
     else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
@@ -311,6 +311,13 @@ NVN(nvnTextureBuilderGetStorageSize, size_t, const NVNtextureBuilder *b) {
 NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L); return L.align;
 }
+// The tiled levels of a sparse texture (nvn_tex.c). SHIN MEGAMI TENSEI V's RHI sizes a sparse texture's mip tail as the storage of all levels less that of the tiled ones; the unimplemented stub
+// left its stack slot as it was, a count past the texture's levels, and the tail came out negative: a 0xffe00000-byte pool allocation and Unreal's out-of-memory abort at boot
+static void sparse_layout(const nvn_texdesc *d, NVNtextureSparseTileLayout *o) {
+    uint32_t w, h, z; o->numTiledLevels = nvn_tex_sparse_tiles(d, &w, &h, &z);
+    o->tileWidth = (int)w; o->tileHeight = (int)h; o->tileDepth = (int)z;
+}
+NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNtextureSparseTileLayout *o) { sparse_layout(&((const tex_builder_t *)b)->d, o); }
 #define TX(t) ((tex_t *)(t))
 #define CTX(t) ((const tex_t *)(t))
 // Textures the CPU fills in place (profile tex_flush_upload): Tears of the Kingdom streams its textures (TexToGo, already in the GPU's block-linear layout) straight into
@@ -442,6 +449,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     nvn_tex_layout(&o->d, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     o->serial = nvn_new_serial(); mtl_tex_init(o);
+    o->sparse = s->pool && (s->pool->flags & 0x200) && o->mem && nvn_sparse_tex(s->pool, (uint64_t)(uintptr_t)o->mem, o->serial);   // after the serial (vpool_tex)
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
         static int ti = -1; static uint32_t tw, th;
         if (ti < 0) { const char *e = getenv("DM_NVN_TEXINFO"); ti = e && sscanf(e, "%ux%u", &tw, &th) == 2; }
@@ -465,6 +473,7 @@ NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width;
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
 NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth; }
 NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
+NVN(nvnTextureGetSparseTileLayout, void, const NVNtexture *t, NVNtextureSparseTileLayout *o) { sparse_layout(&CTX(t)->d, o); }
 NVN(nvnTextureGetStride, ptrdiff_t, const NVNtexture *t) { return (ptrdiff_t)CTX(t)->d.stride; }   // the row stride of a linear texture as built (0 for block-linear ones)
 // The queries below are used by Engage (Unity) at startup: it calls MemoryPoolMap on "the pool the texture / buffer lives in", and with a stub returning 0 it dereferenced a null pool and crashed
 NVN(nvnTextureGetLevels, int, const NVNtexture *t) { return (int)CTX(t)->d.levels; }
@@ -1873,7 +1882,9 @@ NVN(nvnCommandBufferSetDebugLabel, void, NVNcommandBuffer *c, const char *s) { (
 typedef struct { NVNmemoryPool *phys; int64_t poff, voff; uint64_t size; int32_t storage_class, _pad; } map_req;
 _Static_assert(sizeof(map_req) == 0x28, "NVNmappingRequest");
 // True sparse virtual pools (Monster Hunter Rise: RE Engine's GPU heap is one 64 GB virtual pool, built from separately allocated 4 MB physical pools mapped at offsets of their own; boot maps 45 of them
-// over the first 180 MB). A virtual pool larger than the whole application pool cannot be one alias of a physical pool, so at Initialize it gets an address range of its own (reserved, inaccessible),
+// over the first 180 MB; SHIN MEGAMI TENSEI V: Unreal's streaming textures, a pool of 128 KB to a few MB each, over a thousand in its opening, mapped 64 KB page by page from some twenty physical pools,
+// the first request often for a level past the pool's start, so an alias would begin before the physical pool). A virtual pool larger than the whole application pool cannot be one alias of a physical
+// pool, nor can any virtual pool of a profile with virtual_pools sparse, so at Initialize it gets an address range of its own (reserved, inaccessible),
 // and every mapping request vm_remaps the physical pool's pages over its part of that range: the virtual addresses then read and write the same memory as the physical pool, as the GPU page table does
 // on hardware, and buffer / texture addresses stay CPU addresses. Each run of mapped pages is registered with the replay as a pool of its own (mtl_pool_add), rebuilt when a request joins or splits runs.
 // Unmapping puts inaccessible pages back. The reservation is the pool's size, at most 64 GB on the Mac and 1 GB on iOS.
@@ -1882,14 +1893,24 @@ _Static_assert(sizeof(map_req) == 0x28, "NVNmappingRequest");
 // that set it), and the host reads textures of a sparse pool through it (nvn_sparse_copy): such a texture is uploaded from what the table points at, with unmapped pages read as 0,
 // and uploaded again only when a mapping in its range changes or the CPU writes a physical page behind it (nvn_sparse_since; the physical pools are dirty-tracked). The game fills
 // its sparse textures (flag 0x20, 32 GB into the pool) that way: it writes the tiles on the CPU into 4 MB physical pools, then maps them; no GPU copy writes them
-enum { NVPOOL = 4, NVRUN = 1024, VPT_LEAF = 512 };   // a page-table leaf covers 2 MB
+// Each sparse pool's state is allocated at Initialize and hangs off its pool_t (vp), which MapVirtual and TextureInitialize follow; g_vps lists them all by base, for the lookups
+// that start from an address (nvn_host_readable) and for a texture's pool (vpool_tex, a binary search). The mapped runs grow as needed (SHIN MEGAMI TENSEI V has over a thousand
+// pools of a few runs each)
+enum { VPT_LEAF = 512 };   // a page-table leaf covers 2 MB
 typedef struct { const uint8_t *phys; uint64_t gen; } vpte;
-static struct vpool { const pool_t *pool; uint8_t *base; uint64_t len, size, top; int nrun; struct { uint64_t lo, hi; } run[NVRUN]; vpte **pt; } g_vp[NVPOOL];   // len: reserved; size: the pool's; top: highest mapped end so far (logged per 128 MB)
+typedef struct { uint64_t lo, hi; } vrun;
+struct vpool { const pool_t *pool; uint8_t *base; uint64_t len, size, top, from; int nrun; vrun *run; vpte **pt; };   // len: reserved; size: the pool's; top: highest mapped end so far (logged per 128 MB); from: a serial taken at its reservation (vpool_tex)
+static struct vpool **g_vps; static int g_nvp, g_capvp;   // sorted by base
+static uint64_t g_vp_res, g_vp_res_peak;   // address space the sparse pools hold reserved, and its high-water mark (logged per 64 MB: on iOS it comes out of what the guest block and Metal leave)
 static pthread_mutex_t g_vp_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_vp_gen;   // bumped per mapping request
-static struct vpool *vpool_of(const pool_t *o) { for (int i = 0; i < NVPOOL; i++) if (g_vp[i].pool == o && g_vp[i].base) return &g_vp[i]; return NULL; }
-static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range, or NULL for a pool that keeps the alias
-    if (!(o->flags & 0x200) || o->size <= DM_GAME_APP_POOL) return NULL;
+static int vps_find(uint64_t a) {   // the last pool in g_vps whose base ≤ a, -1 if none. Caller holds g_vp_mu
+    int lo = 0, hi = g_nvp - 1, hit = -1;
+    while (lo <= hi) { int m = (lo + hi) / 2; if ((uint64_t)(uintptr_t)g_vps[m]->base <= a) { hit = m; lo = m + 1; } else hi = m - 1; }
+    return hit;
+}
+static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL for a pool that keeps the alias
+    if (!(o->flags & 0x200) || (!DM_GAME_NVN_VPOOL_SPARSE && o->size <= DM_GAME_APP_POOL)) return NULL;
 #if TARGET_OS_IPHONE   // 1 GB: Monster Hunter Rise's buffers stay under 0x20100000 through its opening, its textures (32 GB in) are read through the page table, and 4 GB guest + 1 GB stays near the 5 GB proven on a phone
     uint64_t len = o->size < (1ull << 30) ? o->size : 1ull << 30;
 #else
@@ -1897,37 +1918,44 @@ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range, or
 #endif
     void *a = mmap(NULL, len, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (a == MAP_FAILED) { LOG("[RED] virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
+    struct vpool *v = calloc(1, sizeof *v);
+    if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) die("sparse pool page table allocation failed");
+    v->pool = o; v->base = a; v->len = len; v->size = o->size;
     pthread_mutex_lock(&g_vp_mu);
-    int i = 0; while (i < NVPOOL && g_vp[i].base) i++;
-    if (i == NVPOOL) { pthread_mutex_unlock(&g_vp_mu); munmap(a, len); LOG("[RED] more than %d sparse virtual pools", NVPOOL); return NULL; }
-    g_vp[i].pool = o; g_vp[i].base = a; g_vp[i].len = len; g_vp[i].size = o->size; g_vp[i].nrun = 0;
-    if (!(g_vp[i].pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *g_vp[i].pt))) die("sparse pool page table allocation failed");
+    if (g_nvp == g_capvp && !(g_vps = realloc(g_vps, (size_t)(g_capvp = g_capvp ? g_capvp * 2 : 16) * sizeof *g_vps))) die("sparse pool list allocation failed");
+    int i = vps_find((uint64_t)(uintptr_t)a) + 1, n = ++g_nvp;
+    memmove(&g_vps[i + 1], &g_vps[i], (size_t)(n - 1 - i) * sizeof *g_vps); g_vps[i] = v; o->vp = v; v->from = nvn_new_serial();
+    uint64_t res = g_vp_res += len, old = g_vp_res_peak; if (res > old) g_vp_res_peak = res;
     pthread_mutex_unlock(&g_vp_mu);
-    LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): sparse, own address range %p+%#llx, physical pages are remapped into it", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len);
+    if (n <= 4 || !(n & (n - 1)))   // the first few, then at each power of two
+        LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): sparse, own address range %p+%#llx, physical pages are remapped into it (%d sparse pools now)", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len, n);
+    if (res > old && res >> 26 != old >> 26) LOG("[mem] sparse virtual pools reserve up to %.2f GB of address space (%d pools)", res / 1073741824.0, n);
     return a;
 }
-static void vpool_release(const pool_t *o) {
-    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_of(o);
-    if (v) { for (int k = 0; k < v->nrun; k++) mtl_pool_del(v->base + v->run[k].lo); munmap(v->base, v->len);
+static void vpool_release(pool_t *o) {
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = o->vp;
+    if (v) { for (int k = 0; k < v->nrun; k++) mtl_pool_del(v->base + v->run[k].lo); munmap(v->base, v->len); g_vp_res -= v->len;
         for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
-        free(v->pt); memset(v, 0, sizeof *v); }
+        int i = vps_find((uint64_t)(uintptr_t)v->base);
+        if (i >= 0 && g_vps[i] == v) { memmove(&g_vps[i], &g_vps[i + 1], (size_t)(g_nvp - 1 - i) * sizeof *g_vps); g_nvp--; }
+        free(v->pt); free(v->run); free(v); o->vp = NULL; }
     pthread_mutex_unlock(&g_vp_mu);
 }
 // Mapped runs of a sparse pool: [lo, hi) sorted, disjoint, adjacent runs merged. Caller holds g_vp_mu
 static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
-    uint64_t nl[NVRUN][2]; int nn = 0; uint64_t mlo = lo, mhi = hi;
+    vrun *nl = malloc((size_t)(v->nrun + 2) * sizeof *nl); int nn = 0; uint64_t mlo = lo, mhi = hi;   // an unmap splits at most one run in two
+    if (!nl) die("sparse pool run list allocation failed");
     for (int k = 0; k < v->nrun; k++) {
         uint64_t a = v->run[k].lo, b = v->run[k].hi;
-        if (b < lo || a > hi || (!mapped && (b == lo || a == hi))) { if (nn < NVRUN) { nl[nn][0] = a; nl[nn][1] = b; nn++; } continue; }   // untouched (an unmap leaves adjacent runs alone)
+        if (b < lo || a > hi || (!mapped && (b == lo || a == hi))) { nl[nn++] = (vrun){a, b}; continue; }   // untouched (an unmap leaves adjacent runs alone)
         mtl_pool_del(v->base + a);
         if (mapped) { if (a < mlo) mlo = a; if (b > mhi) mhi = b; continue; }   // joins the new run
-        if (a < lo && nn < NVRUN) { nl[nn][0] = a; nl[nn][1] = lo; nn++; mtl_pool_add(v->base + a, lo - a); }   // what the unmap leaves on either side
-        if (b > hi && nn < NVRUN) { nl[nn][0] = hi; nl[nn][1] = b; nn++; mtl_pool_add(v->base + hi, b - hi); }
+        if (a < lo) { nl[nn++] = (vrun){a, lo}; mtl_pool_add(v->base + a, lo - a); }   // what the unmap leaves on either side
+        if (b > hi) { nl[nn++] = (vrun){hi, b}; mtl_pool_add(v->base + hi, b - hi); }
     }
-    if (mapped && nn < NVRUN) { nl[nn][0] = mlo; nl[nn][1] = mhi; nn++; mtl_pool_add(v->base + mlo, mhi - mlo); }
-    if (nn == NVRUN) LOG("[RED] virtual pool %p: more than %d separate mapped runs", (const void *)v->pool, NVRUN);
-    for (int a = 1; a < nn; a++) for (int b = a; b > 0 && nl[b][0] < nl[b - 1][0]; b--) { uint64_t t0 = nl[b][0], t1 = nl[b][1]; nl[b][0] = nl[b - 1][0]; nl[b][1] = nl[b - 1][1]; nl[b - 1][0] = t0; nl[b - 1][1] = t1; }
-    v->nrun = nn; for (int k = 0; k < nn; k++) { v->run[k].lo = nl[k][0]; v->run[k].hi = nl[k][1]; }
+    if (mapped) { nl[nn++] = (vrun){mlo, mhi}; mtl_pool_add(v->base + mlo, mhi - mlo); }
+    for (int a = 1; a < nn; a++) for (int b = a; b > 0 && nl[b].lo < nl[b - 1].lo; b--) { vrun t = nl[b]; nl[b] = nl[b - 1]; nl[b - 1] = t; }
+    free(v->run); v->run = nl; v->nrun = nn;
 }
 // Page table of a sparse pool (see above). Caller holds g_vp_mu
 static const vpte *vpt_get(const struct vpool *v, uint64_t o) { const vpte *l = v->pt[o >> 21]; return l ? &l[(o >> 12) & (VPT_LEAF - 1)] : NULL; }
@@ -1942,10 +1970,11 @@ static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t
 }
 static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp_mu; → 0 on failure
     uint64_t pg = (uint64_t)getpagesize();
-    if (r->voff < 0 || (uint64_t)r->voff + r->size > v->size) { LOG("[RED] virtual pool %p: request at %#llx+%#llx is beyond the pool's %#llx", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)v->size); return 0; }
+    if (r->voff < 0 || r->size > v->size || (uint64_t)r->voff > v->size - r->size) {   // no overflow with a huge size
+        LOG("[RED] virtual pool %p: request at %#llx+%#llx is beyond the pool's %#llx", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)v->size); return 0; }
     if (((uint64_t)r->voff | r->size | (uint64_t)r->poff) & 0xFFF) { LOG("[RED] virtual pool %p: request %#llx+%#llx (physical offset %#llx) is not 4 KB aligned", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)r->poff); return 0; }
     const pool_t *ph = (const pool_t *)r->phys;
-    if (ph && (!ph->mem || r->poff < 0 || (uint64_t)r->poff + r->size > ph->size)) { LOG("[RED] virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }
+    if (ph && (!ph->mem || r->poff < 0 || r->size > ph->size || (uint64_t)r->poff > ph->size - r->size)) { LOG("[RED] virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }
     vpt_set(v, (uint64_t)r->voff, r->size, ph ? ph->mem + r->poff : NULL);
     vm_address_t to = (vm_address_t)(v->base + r->voff);
     // Not aliased (see above): only textures read through the page table see it; the GPU cannot address it directly
@@ -1971,7 +2000,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
 }
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *rq) {
     pool_t *o = (pool_t *)p; const map_req *r = (const map_req *)rq;
-    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_of(o); int ok = 1;
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = o->vp; int ok = 1;
     for (int i = 0; v && i < n && ok; i++) ok = vpool_map(v, &r[i]);
     pthread_mutex_unlock(&g_vp_mu);
     if (v) return (NVNboolean)ok;
@@ -2215,46 +2244,62 @@ NVN(nvnCommandBufferMultiDrawArraysIndirectCount, void, NVNcommandBuffer *c, NVN
 // Whether the host can read n bytes at a guest address: outside a sparse virtual pool always; inside one only where pages are mapped (nvn_mtl.m reads multi-draw counts there)
 int nvn_host_readable(uint64_t a, uint64_t n) {
     int ok = 1; pthread_mutex_lock(&g_vp_mu);
-    for (int k = 0; k < NVPOOL; k++) { struct vpool *v = &g_vp[k]; if (!v->base || a < (uint64_t)(uintptr_t)v->base || a >= (uint64_t)(uintptr_t)v->base + v->len) continue;
+    int k = vps_find(a); struct vpool *v = k >= 0 ? g_vps[k] : NULL;
+    if (v && a < (uint64_t)(uintptr_t)v->base + v->len) {
         uint64_t o = a - (uint64_t)(uintptr_t)v->base; ok = 0;
         for (int r = 0; r < v->nrun; r++) if (o >= v->run[r].lo && o + n <= v->run[r].hi) { ok = 1; break; }
-        break; }
+    }
     pthread_mutex_unlock(&g_vp_mu); return ok;
 }
 // Sparse virtual addresses alias physical pools, so guest ranges alone cannot
-// prove copy independence. Like nvn_sparse_pool, pool lifetime is fixed while used.
+// prove copy independence. The pools come and go (SHIN MEGAMI TENSEI V finalizes them all the time), so g_vps is read under g_vp_mu: the ranges are disjoint and sorted, so only
+// the last pool starting below hi can overlap [lo, hi)
 int nvn_sparse_alias(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return 0;
-    for (int k = 0; k < NVPOOL; k++) { const struct vpool *v = &g_vp[k];
-        uint64_t base = (uint64_t)(uintptr_t)v->base;
-        if (base && lo < base + v->len && base < hi) return 1;
-    }
-    return 0;
+    pthread_mutex_lock(&g_vp_mu);
+    int k = vps_find(hi - 1), r = k >= 0 && lo < (uint64_t)(uintptr_t)g_vps[k]->base + g_vps[k]->len;
+    pthread_mutex_unlock(&g_vp_mu); return r;
 }
 // Textures of a sparse pool, read through its page table (see the sparse pools above): whether a pool is one, a copy of a texture's bytes (unmapped pages read as 0; → bytes not mapped),
 // whether its content may have changed since an upload (a mapping in its range newer than gen, or a physical page behind it written after the dirty-page stamp), and the write
 // protection of the physical pages behind it (taken before an upload, as for any packaged texture)
-static struct vpool *vpool_at(const void *pool, uint64_t a) {
-    for (int k = 0; k < NVPOOL; k++) { struct vpool *v = &g_vp[k]; if (v->base && v->pool == pool && a >= (uint64_t)(uintptr_t)v->base && a < (uint64_t)(uintptr_t)v->base + v->size) return v; }
-    return NULL;
+// A texture can outlive its pool, and the game can reuse the pool object's memory: vp is taken only from a live pool (its magic, cleared at Finalize after vpool_release has
+// cleared vp under g_vp_mu), and followed only under that lock. vp is read first: while it is set, Finalize has not got to its magic
+static struct vpool *pool_vp(const void *pool) { const pool_t *p = pool; struct vpool *v = p->vp; return v && p->magic == MAGIC('P', 'O', 'O', 'L') ? v : NULL; }
+static struct vpool *vpool_at(const void *pool, uint64_t a) {   // caller holds g_vp_mu
+    struct vpool *v = pool_vp(pool);
+    return v && v->pool == pool && a >= (uint64_t)(uintptr_t)v->base && a < (uint64_t)(uintptr_t)v->base + v->size ? v : NULL;
 }
-int nvn_sparse_pool(const void *pool) { int r = 0; for (int k = 0; k < NVPOOL; k++) r |= g_vp[k].base && g_vp[k].pool == pool; return r; }   // no lock: a slot is set once at Initialize, cleared at Finalize; called per texture lookup
+// At TextureInitialize, after the texture's serial is taken: whether a is in a live sparse pool, the one the replay will find for the texture (vpool_tex)
+int nvn_sparse_tex(const void *pool, uint64_t a, uint64_t serial) {
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); int r = v && v->from < serial; pthread_mutex_unlock(&g_vp_mu); return r;
+}
+// The pool a sparse texture was initialized in, if it is still live. Caller holds g_vp_mu. A texture can outlive its pool (SHIN MEGAMI TENSEI V finalizes its per-texture pools all
+// the time), the game can copy the texture object by value and finalize it while a copy is still replayed, and a later pool can take the same pool object or the same addresses.
+// So the pool is found from the texture alone: its base is mem - off, and a pool made since at that base was made after the texture (its from is above the texture's serial).
+// Not through the guest's pool object, which may be another pool by now, nor by address alone: a pool's page table reaches past its reservation (iOS: 1 GB), where another pool can be
+static struct vpool *vpool_tex(const tex_t *t, uint64_t a) {
+    uint64_t base = (uint64_t)(uintptr_t)t->mem - (uint64_t)t->off; int k = t->sparse ? vps_find(base) : -1; struct vpool *v = k >= 0 ? g_vps[k] : NULL;
+    return v && (uint64_t)(uintptr_t)v->base == base && v->from < t->serial && a >= base && a - base < v->size ? v : NULL;
+}
 uint64_t nvn_sparse_gen(void) { return atomic_load(&g_vp_gen); }
-uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) {
-    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); uint64_t miss = 0;
-    if (!v) { pthread_mutex_unlock(&g_vp_mu); memset(dst, 0, n); return n; }
-    for (uint64_t p = 0, o = a - (uint64_t)(uintptr_t)v->base; p < n;) {
+// → the bytes unmapped (read as 0), ~0 when the pool is gone (all 0). pages (or NULL): a byte per 4 KB page of [a, a+n), 1 where mapped, taken with the bytes
+uint64_t nvn_sparse_copy(const tex_t *t, void *dst, uint64_t a, uint64_t n, uint8_t *pages) {
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_tex(t, a); uint64_t miss = 0, i = 0;
+    if (!v) { pthread_mutex_unlock(&g_vp_mu); memset(dst, 0, n); if (pages && n) memset(pages, 0, ((a + n - 1) >> 12) - (a >> 12) + 1); return ~0ull; }
+    for (uint64_t p = 0, o = a - (uint64_t)(uintptr_t)v->base; p < n;) {   // a step per 4 KB page
         uint64_t at = o + p, k = 0x1000 - (at & 0xFFF); if (k > n - p) k = n - p;
         const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
         if (e && e->phys) memcpy((uint8_t *)dst + p, e->phys + (at & 0xFFF), k); else { memset((uint8_t *)dst + p, 0, k); miss += k; }
+        if (pages) pages[i++] = e && e->phys;
         p += k;
     }
     pthread_mutex_unlock(&g_vp_mu); return miss;
 }
-// Runs of consecutive physical pages behind [a, a+n): fn on each (nonzero stops the walk and is returned), or 1 at the first page mapped after gen (gen ~0 = do not look)
-static int vpt_walk(const void *pool, uint64_t a, uint64_t n, uint64_t gen, int (*fn)(const uint8_t *, uint64_t, uint64_t), uint64_t arg) {
-    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); int r = 0;
-    if (!v) { pthread_mutex_unlock(&g_vp_mu); return 1; }
+// Runs of consecutive physical pages behind [a, a+n): fn on each (nonzero stops the walk and is returned), or 1 at the first page mapped after gen (gen ~0 = do not look); -1 when the pool is gone
+static int vpt_walk(const tex_t *t, uint64_t a, uint64_t n, uint64_t gen, int (*fn)(const uint8_t *, uint64_t, uint64_t), uint64_t arg) {
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_tex(t, a); int r = 0;
+    if (!v) { pthread_mutex_unlock(&g_vp_mu); return -1; }
     const uint8_t *rs = NULL, *re = NULL; uint64_t o = a - (uint64_t)(uintptr_t)v->base;
     for (uint64_t at = o & ~0xFFFull; at < o + n && at < v->size && !r; at += 0x1000) {
         const vpte *e = vpt_get(v, at);
@@ -2270,13 +2315,13 @@ static int vpt_walk(const void *pool, uint64_t a, uint64_t n, uint64_t gen, int 
 }
 static int run_written(const uint8_t *p, uint64_t n, uint64_t stamp) { return nvn_dirty_since(p, n, stamp); }
 static int run_protect(const uint8_t *p, uint64_t n, uint64_t unused) { (void)unused; nvn_dirty_protect(p, n); return 0; }
-int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp) { return vpt_walk(pool, a, n, gen, run_written, stamp); }
-int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every page of [a, a+n) has memory behind it
-    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); int ok = v != NULL;
+int nvn_sparse_since(const tex_t *t, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp) { return vpt_walk(t, a, n, gen, run_written, stamp); }   // 1 written or remapped, -1 gone
+int nvn_sparse_mapped(const tex_t *t, uint64_t a, uint64_t n) {   // every page of [a, a+n) has memory behind it
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_tex(t, a); int ok = v != NULL;
     for (uint64_t o = v ? (a - (uint64_t)(uintptr_t)v->base) & ~0xFFFull : 0, end = v ? a - (uint64_t)(uintptr_t)v->base + n : 0; ok && o < end; o += 0x1000) { const vpte *e = o < v->size ? vpt_get(v, o) : NULL; ok = e && e->phys; }
     pthread_mutex_unlock(&g_vp_mu); return ok;
 }
-void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
+void nvn_sparse_protect(const tex_t *t, uint64_t a, uint64_t n) { vpt_walk(t, a, n, ~0ull, run_protect, 0); }
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind});
 }

@@ -122,11 +122,20 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `nvn_tex.c` `level_walk`: a level at least one tile wide, high and deep is laid out with its width padded to whole tiles, the levels from the first smaller one on form the mip tail (packed as usual), and the storage is whole tiles, 64 KB aligned.
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md): laid out unpadded, the 1024×1024 ASTC 6×6 clothes of Hinoa and Minoto (43 GOBs wide instead of 48, level 1 at 0x81000 instead of 0x90000) read 2,183 all-zero blocks in level 0 and 3,043 in level 1, which ASTC decodes as its error colour: their trousers, sleeves and gloves were magenta, worst in Kamura Village.
 
+### Block height of sparse textures with 8- or 16-byte blocks
+
+- **Symptom:** walls in bright and dark patches: 1024×1024 and 1024×512 DXT5 lightmaps scrambled in 4-texel columns.
+- **Cause:** a sparse texture with 8- or 16-byte blocks has a block height of at most 8 GOBs, so its 64 KB tile is 16 GOBs wide and 8 high (64 × 64 blocks of 16 bytes, 128 × 64 of 8), the standard tiled-resource shape. Monster Hunter Rise's packaged layouts say so; a sparse texture with no packaged layout took the automatic choice, 16 GOBs from 86 block rows on.
+- **Fix:** `nvn_tex_layout` caps such a texture at 8 GOBs when it has no packaged layout (`nvn_tex.c`, the comment at `SPARSE_TILE`); a texture that is not sparse, and a sparse one with 4-byte blocks, keep the automatic choice (a `t_tex` case checks the three).
+- **Found on:** [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md): the classroom's lightmaps (sparse, no packaged layout). Laid out with 8, the game's level 1 is its level 0 halved (mean difference of the blocks' first colour 23, against 139 or more with 16 in either level).
+- **Check:** to check a layout against the game's data, `memdump` a texture's storage, deswizzle level 0 and level 1 at each block height and compare level 1 with level 0 shrunk: the right height is the one where they agree.
+
 ### Sparse textures bound from their first mapped level
 
 - **Symptom:** streamed textures read 0 (magenta on Monster Hunter Rise's title screen's clothes).
 - **Cause:** the translator drops TEX's LOD clamp and its residency predicate, so streamed textures were sampled at levels the game had not mapped yet.
 - **Fix:** a sparse texture is bound as a view starting at its first level whose pages, and those of every smaller level, are all mapped (`sparse_view` in `nvn_mtl.m`). That samples exactly as a minimum LOD would; the view follows each upload.
+- **Note:** a sparse texture whose pool the game finalized first keeps its last upload (`tex_mtl_`) while its texture object lives: its pages are unmapped. A sampled one is read only through the pool it was initialized in (`tex_t` `sparse`), which the host finds from the texture alone (`vpool_tex`): the live pool whose base is the texture's `mem - off`, made before the texture's serial. So a copy of the texture object still finds it after the object is finalized, a pool made later in the same object or at the same addresses is another pool, and a texture past its pool's reservation (iOS: 1 GB) is not taken for the pool reserved there. A re-upload that finds the pool gone leaves the texture and the level it is bound from as they were; a first upload then reads 0. The level comes from the mappings the bytes were gathered with (test `t_sparse_life`). [SHIN MEGAMI TENSEI V](../../dm/games/010063B012DC6000/README.md) finalizes its per-texture pools all the time ([Small virtual pools made sparse](nvn-objects.md#small-virtual-pools-made-sparse-virtual_pools-sparse)).
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md).
 
 ### Sampler reduction (min / max)

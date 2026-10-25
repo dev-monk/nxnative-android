@@ -46,6 +46,11 @@ static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field
     // +0x10) and main+0x134d380 (int, AsVariableInt at +0x10)
     { "0d9649011312f62e93f6a5673a09d7e9", "Unreal t.MaxFPS", 0x76fef58 + 0x10, 0, FPS_F32, 2 },
     { "0d9649011312f62e93f6a5673a09d7e9", "Unreal rhi.SyncInterval", 0x75ad0d0 + 0x10, 0, VSYNCS_I32, 2 },
+    // SHIN MEGAMI TENSEI V 1.0.0: Unreal Engine 4.23's t.MaxFPS and rhi.SyncInterval, the same layout (names in UTF-16). The game's code sets t.MaxFPS 30 at run time (its config
+    // has none) and the engine's Switch device profile sets rhi.syncinterval=2 (BaseSwitchDeviceProfiles.ini); rhi.SyncInterval 1 alone left it at 30. Registered at main+0xc7ba64 (float,
+    // default 0; AsVariableFloat stored at +0x10) and main+0xbd00ac (int, default 1; AsVariableInt at +0x10)
+    { "4828bbb9e91e802470fec7ac68397bd1", "Unreal t.MaxFPS", 0x761ed40 + 0x10, 0, FPS_F32, 2 },
+    { "4828bbb9e91e802470fec7ac68397bd1", "Unreal rhi.SyncInterval", 0x7520648 + 0x10, 0, VSYNCS_I32, 2 },
     // Luigi's Mansion 3 1.4.0: Next Level Games' frame limiter. At the end of each frame the main thread calls the frame callbacks (main+0xb7c308) with the milliseconds since the frame
     // started; the limiter (main+0x7a3e70) runs jobs or sleeps until 33.333 ms have passed, the float at main+0x13c94dc (read only there, at main+0x7a3ea8 and main+0x7a3f18), and the game
     // steps by the time that really passed. The game asks for present interval 2 too, which the profile's present_interval display ignores; both are needed

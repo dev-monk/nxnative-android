@@ -155,4 +155,14 @@ CUTS = {
     (0x346190, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x34622c, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # SDK 9.3.1 sdk ad3fdfbd62a5 (SHIN MEGAMI TENSEI V 1.0.0, Unreal Engine 4.23): the node area cut, and regions of 1 GB and more aligned to 32 MB, as DRAGON QUEST XI S's SDK 7.3.2 build,
+  # whose AddressRegionManager this is at other offsets. Unreal's nninitStartup takes one region for the engine (62 GB, capped by -SwitchVirtualAddressSpaceSize= in the profile's game_args);
+  # with the 1 GB node area and 1 GB alignment a 4 GB region would start 1 GB into the alias region. The constructor is at sdk+0xd2230 (the limit at +0xd2240 from orr w8,wzr,#0x3fe00000,
+  # the occupied length at +0xd22dc from orr w9,wzr,#0x3fe00000); VammManager::AllocateAddressRegion (sdk+0xd2340) aligns a region by its size: 64 KB under 2 MB, 2 MB under 4 MB,
+  # 4 MB under 32 MB, 32 MB under 1 GB, else 1 GB (+0xd243c)
+  'ad3fdfbd62a5f4b082d385ffe420d440': [
+    (0xd2240, 'e8230b32', '087ca052', 'AddressRegionManager constructor: node area limit orr w8,wzr,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0xd22dc, 'e9230b32', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0xd243c, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more orr w10,wzr,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
 }
