@@ -111,6 +111,10 @@ fi
 echo "env.txt:"; "$ADB" shell "run-as $PKG cat files/env.txt" | sed 's/^/  /'
 [ $FRESH = 0 ] || "$ADB" shell "run-as $PKG sh -c 'rm -rf files/save files/temp'"
 
+# Wake the screen first: an activity started on a sleeping display gets no window, so the host waits for its surface (and key presses then end in an ANR). The app's KEEP_SCREEN_ON
+# (front_android.c) keeps it on once the window shows, but cannot wake it. A keyguard with a PIN or pattern still needs the user
+"$ADB" shell input keyevent KEYCODE_WAKEUP
+"$ADB" shell dumpsys window | grep -q 'isKeyguardShowing=true' && echo "note: the lock screen is showing: unlock the device, or the app gets no window until then"
 "$ADB" shell am start -W -n $ACT | grep -E "Status|TotalTime" || true
 T0=$(now); echo "started at $(date +%T)"
 for k in ${KEYS[@]+"${KEYS[@]}"}; do
