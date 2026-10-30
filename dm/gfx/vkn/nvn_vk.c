@@ -125,12 +125,21 @@ void mtl_init(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_on
 // sees them), read for the first time (PF_NEW), or never protected (PF_CMD, PF_ALW) go through the slot's staging buffer into the shadows, by a command buffer that runs ahead of the submission's own.
 // mtl_pool_add gets no pool flags, so pools no record reads as a buffer get no shadow and nothing is protected in them: render-target pools (CPU_NO_ACCESS, which their textures tell mtl_tex_init:
 // a buffer read there is said in red) and shader-code pools (hle_nvn.c reaches those through mtl_addr only, which makes nothing)
-enum { PF_BUF = 1, PF_CMD = 4, PF_NEW = 8, PF_ALW = 16, PF_DUE = 32 };   // ALW: copied at every submission, never protected (see b_commit); DUE: picked by the commit under way
+enum { PF_BUF = 1, PF_CMD = 4, PF_NEW = 8, PF_ALW = 16, PF_DUE = 32, PF_HOT = 64 };   // ALW: copied at every submission, never protected (see b_commit); DUE: picked by the commit under way; HOT: see b_hot
+// The hot set (DM_VK_HOT=1: on; off by default, see the end of this comment). A page written again within HOT_WIN commits of its last write is left unprotected and copied at every commit for HOT_TTL commits, then protected again
+// (it heats up again at its next writes; a frame sent in parts, DM_VK_SPLIT, has several commits). Copying a page that did not change is always right; a write fault and the mprotect calls around it cost far more than copying the page: Paper Mario: The Thousand-Year
+// Door writes about 180 of its 4 KB buffer pages every frame (uniform rings, dynamic vertices), and on the RG 476H the faults, the mprotect calls and the commit's drain of them took
+// several ms of the game thread a frame. Off by default: on the RG 476H it gained nothing (the faults are on guest threads, which are not the limit; submit+present rose 9.8 -> 11.0 ms)
+// and one of two runs hung at a loading curtain. A hot page is copied even in a commit the CPU did not write it in, which can overwrite what a GPU pass wrote into the shadow page earlier
+// in the frame; a sound version copies a hot page only when its bytes changed (keep the last copy, compare)
+#define HOT_WIN 4
+#define HOT_TTL 120
+static int b_hot(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_HOT"); on = e && *e == '1'; if (on) NLOG("DM_VK_HOT=1: buffer pages written again within %d submissions are copied at every one, unprotected (the hot set)", HOT_WIN); } return on; }
 typedef struct b_shadow { VkBuffer buf; VkDeviceMemory mem; VkDeviceAddress gpu; uint64_t size, use_nvn; struct b_shadow *next; } b_shadow;   // use_nvn: the last submission that used it (vkn_sweep)
 // lo, hi: page-rounded, the shadow's extent (offsets in it are from lo); key, end: the pool's own bytes, the only ones an address resolves to (mtl_addr, mtl_gpu_addr: a page it shares with a
 // neighbour holds the neighbour's bytes too, and this pool's shadow never has those uploaded); span: its nvn_dirty range, cached before any protect (mtl_pool_del keys on it);
 // noacc: a CPU_NO_ACCESS pool (mtl_tex_init); nosh: its shadow could not be made (said once, not tried again)
-typedef struct { uintptr_t lo, hi; const void *key; uintptr_t end; uint8_t *pf; const void *span; b_shadow *sh; uint8_t noacc, nosh; } pool_ent;
+typedef struct { uintptr_t lo, hi; const void *key; uintptr_t end; uint8_t *pf, *ht; const void *span; b_shadow *sh; uint8_t noacc, nosh; } pool_ent;   // ht: per page, 1 + commits since its last write (0: none within HOT_WIN), or a hot page's age (b_commit)
 static pool_ent *g_pools; static int g_npool, g_cap, g_plast = -1;
 // The pools by address (under g_pmu): their indices sorted by lo, rebuilt when a pool comes or goes. Pools hold disjoint bytes, so in this order their page-rounded ends rise too, and the
 // first pool that can hold an address is found by a binary search on hi. The replay looked a range up by walking every pool, for every record (b_mark, b_use): Paper Mario: The
@@ -173,7 +182,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, (size_t)g_cap * sizeof *g_pools); if (!g_pools) die("vkn backend: pool table allocation failed"); }
     pool_ent e = {lo & ~(pg - 1), (hi + pg - 1) & ~(pg - 1), mem, hi, NULL, NULL, NULL, 0, 0};
     uintptr_t np = (e.hi - e.lo) / pg;
-    if (g_vk && !(e.pf = calloc(np ? np : 1, 1))) die("vkn backend: page class table allocation failed (%llu pages)", (unsigned long long)np);   // no device: no shadows, nothing tracked
+    if (g_vk && (!(e.pf = calloc(np ? np : 1, 1)) || !(e.ht = calloc(np ? np : 1, 1)))) die("vkn backend: page class table allocation failed (%llu pages)", (unsigned long long)np);   // no device: no shadows, nothing tracked
     // Edge pages, those the pool's own bytes do not fill (16 KB host pages over 4 KB-aligned pools): a neighbour's nvn_dirty range can hold the same page, and two ranges protecting one page
     // break the tracker (a write unprotected and stamped through one leaves the other's state and generations stale). So no pool protects them: copied at every submission (PF_ALW).
     // With 4 KB host pages and 4 KB-aligned pools there are none. Slice 2b: texture protection must leave these pages alone too
@@ -202,7 +211,7 @@ void mtl_pool_del(const void *mem) {
             if (mprotect((void *)e->lo, e->hi - e->lo, PROT_READ | PROT_WRITE)) NRED_ONCE("B: a freed pool's pages could not be made writable again (errno %d)", errno);
         }
         if ((dead = e->sh)) { g_nshadow--; g_shadow_b -= dead->size; }
-        free(e->pf); *e = g_pools[--g_npool]; g_plast = -1; g_psort_dirty = 1; break;
+        free(e->pf); free(e->ht); *e = g_pools[--g_npool]; g_plast = -1; g_psort_dirty = 1; break;
     }
     for (int i = g_nplog - 1; i >= 0; i--) if (g_plog[i].mem == (uintptr_t)mem && g_plog[i].died == ~0ull) { g_plog[i].died = atomic_load(&g_present_n); g_pfreed++; g_pfreed_b += g_plog[i].size; g_plive_b -= g_plog[i].size; break; }
     pthread_mutex_unlock(&g_pmu);
@@ -317,7 +326,7 @@ static void b_rec(const op_hdr *h, const uint8_t *p, const uint8_t *a) {
 }
 // Cumulative statistics (b_report): uploads made, pages by why (0 written since the last commit, 1 read for the first time, 2 copied every time), bytes, B's CPU time at commit; tracked pages now;
 // late: the pages of why 0 that only the re-scan after the drain picked (b_commit), and the drain's and re-scan's share of the commit time
-static _Atomic uint64_t g_bs_up, g_bs_pg[3], g_bs_b, g_bs_ns, g_bs_trk, g_bs_alw, g_bs_max, g_bs_late, g_bs_dns;
+static _Atomic uint64_t g_bs_up, g_bs_pg[3], g_bs_b, g_bs_ns, g_bs_trk, g_bs_alw, g_bs_max, g_bs_late, g_bs_dns, g_bs_hot;
 static uint64_t g_bstamp;   // the dirty generation at the last commit's scan (under g_pmu)
 static VkBufferCopy *g_upc; static b_shadow **g_ups; static int *g_upk, g_nup, g_upcap;   // the upload being built: regions, their shadows and pools (submit thread, under g_pmu)
 static int stg_ensure(sub_slot *s, uint64_t n) {   // the slot's staging buffer holds n bytes (its last submission has completed: mtl_sub_begin waited). 0 = none (said)
@@ -339,7 +348,7 @@ static int stg_ensure(sub_slot *s, uint64_t n) {   // the slot's staging buffer 
     s->stg_map = map; s->stg_cap = cap; s->stg_coh = (vd.mem.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     return 1;
 }
-static int b_protectable(uint8_t f) { return (f & PF_BUF) && !(f & (PF_CMD | PF_ALW)); }   // a tracked page the commit protects (b_commit's drain), due or not
+static int b_protectable(uint8_t f) { return (f & PF_BUF) && !(f & (PF_CMD | PF_ALW | PF_HOT)); }   // a tracked page the commit protects (b_commit's drain), due or not
 // A pool's nvn_dirty range, found before any protect (mtl_pool_del keys on it): every place that takes it comes here (under g_pmu). NULL: none yet (hle_nvn.c adds it just after mtl_pool_add, so a
 // commit can come between) or the tracker's table is full; the pool is copied every time meanwhile. Found now: its buffer pages were copied with no protection and the fresh range's generations
 // say nothing of the writes since (0 <= g_bstamp), so every one is taken as read for the first time (NEW): picked, protected by the drain, then copied at the next commit's scan (slice 2c's fix
@@ -386,7 +395,7 @@ static void tex_record(VkCommandBuffer cb, VkBuffer stg);
 // Naive: the whole dirty set is copied and protected again at every submission. The hot-set scheme (stardew-surface.md: copy the pages written k submissions running without protecting them,
 // protect again once their bytes stop changing) is for the gameplay sub-slice
 static int b_commit(sub_slot *s, uint64_t v) {
-    uint64_t t0 = now_ns(), bytes = 0, pg[3] = {0}, trk = 0, alw = 0, late = 0, dns = 0; int ok = 1;
+    uint64_t t0 = now_ns(), bytes = 0, pg[3] = {0}, trk = 0, alw = 0, late = 0, dns = 0, hot = 0; int ok = 1, hon = b_hot();
     pthread_mutex_lock(&g_pmu);
     uint64_t stamp = nvn_dirty_now();
     g_nup = 0;
@@ -396,9 +405,16 @@ static int b_commit(sub_slot *s, uint64_t v) {
         pool_span(e);   // the range, found before any protect; found now: every buffer page NEW (pool_span)
         for (uintptr_t i = 0; i < np; i++) {
             uint8_t f = e->pf[i]; if (!(f & PF_BUF)) continue;
+            if (f & PF_HOT) {   // copied; at HOT_TTL protected again by this commit's drain (copied after it, as any due page)
+                trk++; alw++; hot++; pg[2]++;
+                if (++e->ht[i] >= HOT_TTL || !hon) { f &= (uint8_t)~PF_HOT; e->ht[i] = 1; }
+                e->pf[i] = (uint8_t)((f & ~PF_NEW) | PF_DUE); continue;
+            }
             int fixed = (f & (PF_CMD | PF_ALW)) || !e->span; trk++; alw += fixed;
-            if (!fixed && !(f & PF_NEW) && !nvn_dirty_since_span(e->span, (const void *)(e->lo + (i << g_sh)), g_pgsz, g_bstamp)) continue;
+            if (!fixed && !(f & PF_NEW) && !nvn_dirty_since_span(e->span, (const void *)(e->lo + (i << g_sh)), g_pgsz, g_bstamp)) { e->ht[i] = e->ht[i] && e->ht[i] < HOT_WIN ? e->ht[i] + 1 : 0; continue; }
             pg[fixed ? 2 : f & PF_NEW ? 1 : 0]++;
+            if (!fixed && !(f & PF_NEW) && hon && e->ht[i]) { f |= PF_HOT; e->ht[i] = 0; }   // written again soon: left writable from now on (its fault made it so)
+            else e->ht[i] = fixed ? 0 : 1;
             e->pf[i] = (uint8_t)((f & ~PF_NEW) | PF_DUE);
         }
         uint64_t td = now_ns();
@@ -469,7 +485,7 @@ static int b_commit(sub_slot *s, uint64_t v) {
     if (n || nt) vk.vkEndCommandBuffer(s->up);
     g_ntj = 0;
     atomic_fetch_add(&g_bs_up, n != 0); for (int i = 0; i < 3; i++) atomic_fetch_add(&g_bs_pg[i], ok ? pg[i] : 0); atomic_fetch_add(&g_bs_b, n ? bytes : 0);
-    atomic_store(&g_bs_trk, trk); atomic_store(&g_bs_alw, alw); if (ok && pg[0] + pg[1] + pg[2] > atomic_load(&g_bs_max)) atomic_store(&g_bs_max, pg[0] + pg[1] + pg[2]);
+    atomic_store(&g_bs_trk, trk); atomic_store(&g_bs_alw, alw); atomic_store(&g_bs_hot, hot); if (ok && pg[0] + pg[1] + pg[2] > atomic_load(&g_bs_max)) atomic_store(&g_bs_max, pg[0] + pg[1] + pg[2]);
     atomic_fetch_add(&g_bs_late, ok ? late : 0); atomic_fetch_add(&g_bs_dns, dns); atomic_fetch_add(&g_bs_ns, now_ns() - t0);
     return n || nt;   // 1: s->up goes ahead of s->cb (buffer copies, texture jobs, or both)
 }
@@ -484,11 +500,11 @@ static void b_report(const char *why) {
     pthread_mutex_lock(&g_pmu); uint64_t nsh = g_nshadow, shb = g_shadow_b, made = g_shadow_made; pthread_mutex_unlock(&g_pmu);
     double f = n > p_n ? (double)(n - p_n) : 1.0, all = (double)(pg[0] + pg[1] + pg[2] - p_pg[0] - p_pg[1] - p_pg[2]);
     NLOG("B (shadow buffers) up to frame %llu (%s), per frame over the last %llu: pages uploaded %.2f (written since the last submission %.2f, of them picked only by the re-scan %.2f, read for the first time %.2f, copied every time %.2f), %.1f KiB, "
-         "submissions with an upload %.2f; write faults %.2f, host pre-write unprotects %.2f (process-wide), mprotect calls %.2f; B at commit %.3f ms (the drain and re-scan %.3f ms); now %llu pages tracked (%llu B pages), %llu of them copied every time, "
+         "submissions with an upload %.2f; write faults %.2f, host pre-write unprotects %.2f (process-wide), mprotect calls %.2f; B at commit %.3f ms (the drain and re-scan %.3f ms); now %llu pages tracked (%llu B pages), %llu of them copied every time (%llu hot), "
          "%llu shadows %llu B; totals: %llu pages, %llu B, at most %llu pages in one submission, shadows made %llu destroyed %llu",
          (unsigned long long)n, why, (unsigned long long)(n - p_n), all / f, (double)(pg[0] - p_pg[0]) / f, (double)(late - p_late) / f, (double)(pg[1] - p_pg[1]) / f, (double)(pg[2] - p_pg[2]) / f, (double)(b - p_b) / 1024.0 / f,
          (double)(up - p_up) / f, (double)(fa - p_fa) / f, (double)(pr - p_pr) / f, (double)(mc - p_mc) / f, (double)(ns - p_ns) / 1e6 / f, (double)(dns - p_dns) / 1e6 / f,
-         (unsigned long long)atomic_load(&g_bs_trk), (unsigned long long)g_pgsz, (unsigned long long)atomic_load(&g_bs_alw), (unsigned long long)nsh, (unsigned long long)shb,
+         (unsigned long long)atomic_load(&g_bs_trk), (unsigned long long)g_pgsz, (unsigned long long)atomic_load(&g_bs_alw), (unsigned long long)atomic_load(&g_bs_hot), (unsigned long long)nsh, (unsigned long long)shb,
          (unsigned long long)(pg[0] + pg[1] + pg[2]), (unsigned long long)b, (unsigned long long)atomic_load(&g_bs_max), (unsigned long long)made, (unsigned long long)atomic_load(&g_shadow_freed));
     p_n = n; p_up = up; for (int i = 0; i < 3; i++) p_pg[i] = pg[i]; p_b = b; p_ns = ns; p_fa = fa; p_pr = pr; p_mc = mc; p_late = late; p_dns = dns;
     pthread_mutex_unlock(&mu);
