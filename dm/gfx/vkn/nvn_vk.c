@@ -2561,6 +2561,7 @@ static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescripto
     }
     return 1;
 }
+static uint64_t g_stat_cs_gen;   // sampled descriptors of a dispatch's own storage images, given the general layout (op_dispatch)
 static void op_dispatch(const p_dispatch *d) {
     g_fb_ep++;   // what it writes is not tracked: every feedback copy is made again (fb_copy)
     static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_COMPUTE"); on = !(e && *e == '0'); if (!on) NLOG("DM_VK_COMPUTE=0: dispatches are not run"); }
@@ -2590,6 +2591,20 @@ static void op_dispatch(const p_dispatch *d) {
             VkClearColorValue mg = {{1.0f, 0.0f, 1.0f, 1.0f}}; VkImageSubresourceRange rr = {e->aspect, 0, 1, 0, 1};
             vk.vkCmdClearColorImage(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, &mg, 1, &rr);
             mem_barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT); } }
+    }
+    // A storage image the dispatch also samples (Paper Mario: The Thousand-Year Door's lighting reads the images it writes) is in the general layout now: its sampled descriptors
+    // say so (they were made for the sampled layout before; VUID-vkCmdDispatch-imageLayout-00344, a mismatch the driver may act on)
+    for (uint32_t w = 0; w < (uint32_t)sh->nb; w++) {
+        if (wr[w].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && wr[w].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
+        for (uint32_t a = 0; a < wr[w].descriptorCount; a++) {
+            VkDescriptorImageInfo *q = (VkDescriptorImageInfo *)&wr[w].pImageInfo[a];
+            for (int k = 0; k < ni && q->imageLayout != VK_IMAGE_LAYOUT_GENERAL; k++) {
+                const vkn_img *e = imgs[k]; int hit = 0;
+                for (int v = 0; v < e->nviews && !hit; v++) hit = e->views[v].v == q->imageView;
+                for (int v = 0; v < e->nsviews && !hit; v++) hit = e->sviews[v].v == q->imageView;
+                if (hit) { q->imageLayout = VK_IMAGE_LAYOUT_GENERAL; g_stat_cs_gen++; }
+            }
+        }
     }
     mem_barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
     vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, sh->cpso);

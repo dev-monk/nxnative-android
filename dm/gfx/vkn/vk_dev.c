@@ -164,6 +164,13 @@ int vkn_dev_init(void) {
         VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
         VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT, val_cb, NULL};
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, vd.validation ? &mci : NULL, flags, &ai, nl, lay, ne, ext};   // chained: instance creation's own messages too
+#ifdef VK_EXT_layer_settings
+    // DM_VK_VALIDATION=2: synchronization validation too (the layer's validate_sync setting, given through VK_EXT_layer_settings: on Android no environment reaches the layer)
+    static const VkBool32 on32 = VK_TRUE;
+    static const VkLayerSettingEXT ls = {"VK_LAYER_KHRONOS_validation", "validate_sync", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &on32};
+    VkLayerSettingsCreateInfoEXT lsi = {VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT, NULL, 1, &ls};
+    if (vd.validation && atoi(e) >= 2) { mci.pNext = &lsi; VLOG("DM_VK_VALIDATION=2: synchronization validation on"); }
+#endif
     VkResult r = vk.vkCreateInstance(&ci, NULL, &vd.inst);
     if (r) { VLOG("[RED] vkCreateInstance: %d%s: nothing is drawn", r, r == VK_ERROR_INCOMPATIBLE_DRIVER ? " (VK_ERROR_INCOMPATIBLE_DRIVER: the loader found no driver)" : ""); vd.inst = NULL; vd.absent = r == VK_ERROR_INCOMPATIBLE_DRIVER; return 0; }
 #define VKN_I(n) vk.n = (PFN_##n)vk.vkGetInstanceProcAddr(vd.inst, #n);
