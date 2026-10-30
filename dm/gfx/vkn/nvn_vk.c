@@ -1908,7 +1908,7 @@ static VkPipelineCache g_pcache;
 // The pipeline cache on disk: <DM_VK_SHADERS>/pipelines.vkpc, read when the cache is made, written (whole, through a temporary file) every 300 frames when pipelines were made since
 // and at mtl_drain. Without it every launch compiles every pipeline again: TTYD's title makes ~150 (4.1 s, up to 264 ms each on the RG 476H). The driver checks the header and
 // ignores data from another device or driver. DM_VK_PCACHE=0: in memory only
-static uint64_t g_pc_saved;   // g_pso_made at the last write
+static uint64_t g_pc_saved; static size_t g_pc_size;   // g_pso_made at the last write; the cache's size then (read or written): unchanged, nothing new to write
 static const char *pc_path(void) {
     static char p[1024]; static int done;
     if (!done) { done = 1; const char *x = getenv("DM_VK_PCACHE"), *d = getenv("DM_VK_SHADERS"); if (!(x && *x == '0') && d && *d) snprintf(p, sizeof p, "%s/pipelines.vkpc", d); }
@@ -1926,11 +1926,12 @@ static void pc_save(void) {
     const char *p = pc_path(); if (!p || !g_pcache) return;
     uint64_t made = atomic_load(&g_pso_made); if (made == g_pc_saved) return;
     size_t n = 0; if (vk.vkGetPipelineCacheData(vd.dev, g_pcache, &n, NULL) || !n) return;
+    if (n == g_pc_size) { g_pc_saved = made; return; }   // pipelines found in the cache: nothing new
     void *b = malloc(n); if (!b) return;
     if (vk.vkGetPipelineCacheData(vd.dev, g_pcache, &n, b) == VK_SUCCESS) {
         char t[1040]; snprintf(t, sizeof t, "%s.tmp", p);
         FILE *f = fopen(t, "wb"); int ok = f && fwrite(b, 1, n, f) == n; if (f) ok = !fclose(f) && ok;
-        if (ok && !rename(t, p)) { g_pc_saved = made; NLOG("pipeline cache written: %zu KiB, %llu pipelines made this run", n >> 10, (unsigned long long)made); }
+        if (ok && !rename(t, p)) { g_pc_saved = made; g_pc_size = n; NLOG("pipeline cache written: %zu KiB, %llu pipelines made this run", n >> 10, (unsigned long long)made); }
         else NRED_ONCE("the pipeline cache cannot be written to %s: pipelines are compiled again at the next launch", p);
     }
     free(b);
@@ -1980,7 +1981,7 @@ static void draw_init(void) {   // vkn_hello, before any submission: the dummies
     size_t pcn; void *pcd = pc_read(&pcn); pci.initialDataSize = pcn; pci.pInitialData = pcd;
     if (vk.vkCreatePipelineCache(vd.dev, &pci, NULL, &g_pcache)) {   // data the driver refuses: an empty cache
         pci.initialDataSize = 0; pci.pInitialData = NULL; if (vk.vkCreatePipelineCache(vd.dev, &pci, NULL, &g_pcache)) g_pcache = VK_NULL_HANDLE;   // none: pipelines are made without one
-    } else if (pcn) NLOG("pipeline cache read: %zu KiB from %s", pcn >> 10, pc_path());
+    } else if (pcn) { size_t n = 0; if (!vk.vkGetPipelineCacheData(vd.dev, g_pcache, &n, NULL)) g_pc_size = n; NLOG("pipeline cache read: %zu KiB from %s", pcn >> 10, pc_path()); }
     free(pcd);
     VkCommandPool pool; VkCommandBuffer cb;
     VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, vd.qfam};
