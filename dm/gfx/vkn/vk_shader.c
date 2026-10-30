@@ -603,10 +603,23 @@ static int sha_ok(const void *spv, size_t n, const char *want) {
     dm_sha256(spv, n, d); for (int i = 0; i < 8; i++) snprintf(hx + 2 * i, 3, "%02x", d[i]);
     return !strcmp(hx, want);
 }
+// DM_VK_SPV_OVR=<dir> (diagnostics): <dir>/<key>.spv, where there is one, replaces the module once its own passed the reflection's checks, before the patches (an experiment on the
+// SPIR-V, e.g. spirv-opt --relax-float-ops, without rebuilding the cache). *ovr: the buffer read, freed by the caller
+static void spv_ovr(const char *hk, uint32_t **spv, size_t *nbytes, uint32_t **ovr) {
+    static const char *d = (const char *)1; if (d == (const char *)1) d = getenv("DM_VK_SPV_OVR");
+    if (!d || !*d) return;
+    char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", d, hk);
+    FILE *f = fopen(fp, "rb"); if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint32_t *b = n > 20 && n % 4 == 0 ? malloc((size_t)n) : NULL;
+    if (b && fread(b, 1, (size_t)n, f) == (size_t)n && b[0] == 0x07230203u) { *spv = *ovr = b; *nbytes = (size_t)n; static int nl; if (nl++ < 4) VLOG("shader %s: SPIR-V from %s (DM_VK_SPV_OVR)", hk, fp); }
+    else free(b);
+    fclose(f);
+}
 // A module from its reflection text and SPIR-V (words, patched in place). NULL = refused (said once, with why)
 static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, uint32_t *spv, size_t nbytes, int zst) {
     char hk[17], why[256] = ""; for (int i = 0; i < 8; i++) snprintf(hk + 2 * i, 3, "%02x", key[i]);
-    vkn_shader *sh = calloc(1, sizeof *sh); jv j; memset(&j, 0, sizeof j);
+    vkn_shader *sh = calloc(1, sizeof *sh); jv j; memset(&j, 0, sizeof j); uint32_t *ovr = NULL;
     if (!sh) die("vkn backend: shader entry allocation failed");
     memcpy(sh->key, hk, 17); sh->stage = stage;
     char want[24]; snprintf(want, sizeof want, "%s_b", hk);
@@ -620,7 +633,7 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
     else if (!spv) snprintf(why, sizeof why, "no SPIR-V (%s_b.spv%s)", hk, zst ? ": only its .spv.zst is there, and the directory takes the modules decompressed" : "");
     else if ((long)nbytes != j_i(&j, "spv_bytes", -1) || nbytes % 4) snprintf(why, sizeof why, "SPIR-V of %zu bytes, the reflection says %ld", nbytes, j_i(&j, "spv_bytes", -1));
     else if (!sha_ok(spv, nbytes, j_s(&j, "spv_sha256"))) snprintf(why, sizeof why, "its SPIR-V's SHA-256 is not the reflection's spv_sha256 (%.20s)", *j_s(&j, "spv_sha256") ? j_s(&j, "spv_sha256") : "none");   // before the patch rewrites it
-    else if (refl_take(sh, &j, why, sizeof why) && spv_patch(spv, nbytes / 4, sh, why, sizeof why)) {
+    else if (spv_ovr(hk, &spv, &nbytes, &ovr), refl_take(sh, &j, why, sizeof why) && spv_patch(spv, nbytes / 4, sh, why, sizeof why)) {
         for (int b = 0; b < sh->nb && !*why; b++) if (sh->b[b].kind == VKN_B_C1 && !sh->c1_buf) c1_make(sh, j_s(&j, "c1"), why, sizeof why);
         if (!*why) {
             static int idm = -1; if (idm < 0) { const char *x = getenv("DM_VK_IDMAP"); idm = !(x && *x == '0'); }
@@ -636,7 +649,7 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
             if (ms != spv) free(ms);
         }
     }
-    j_free(&j);
+    j_free(&j); if (ovr) free(ovr);
     if (*why) { VLOG("[RED] shader %s (%s) refused: %s: its draws are skipped", hk, stage == 0 ? "vertex" : stage == 1 ? "pixel" : stage == 5 ? "compute" : "other", why); atomic_fetch_add_explicit(&g_nrefuse, 1, memory_order_relaxed); free(sh); return NULL; }
     sh->id = ++g_shid; atomic_fetch_add_explicit(&g_nload, 1, memory_order_relaxed);
     return sh;
