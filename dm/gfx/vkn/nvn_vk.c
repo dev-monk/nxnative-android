@@ -742,6 +742,16 @@ static void att_barrier(VkImageMemoryBarrier2 *b, vkn_img *e) {
     e->rec = to;
 }
 static void clears_reset(void) { memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0; }
+// Deferred clears (DM_VK_CLEAR_FOLD=0: off). A full clear of a target that no draw follows in its pass (SET_RT X, CLEAR_DS, SET_RT of others) and a CLEAR_TEX of a whole level
+// are kept on the image (pc) instead of being recorded: the next pass that attaches that level and layer takes it as its load op, any other use records it first (pend_resolve:
+// tex_lookup, copies, buffer-to-texture copies, feedback copies), and a dispatch and the submission's end record them all (pend_all). On a tiler a clear recorded alone writes the whole
+// image and the next pass loads it back; folded, the pass starts from the clear colour with no read. Paper Mario: The Thousand-Year Door clears each next target with CLEAR_TEX right
+// before its SET_RT (about 25 a frame, its 960x540 G-buffer among them) and clears 18 depth targets a frame in passes with no draw
+static int g_fold_on = -1;
+static int fold_on(void) { if (g_fold_on < 0) { const char *e = getenv("DM_VK_CLEAR_FOLD"); g_fold_on = !(e && *e == '0'); if (!g_fold_on) NLOG("DM_VK_CLEAR_FOLD=0: clears are recorded where they come"); } return g_fold_on; }
+static uint64_t g_pend[64]; static int g_npend;   // the serials of the images with a deferred clear
+static uint64_t g_stat_pend[4];   // deferred, taken as a load op, recorded between passes, recorded after ending a pass
+static void pend_rec(vkn_img *e, int locked);
 // Opens the pass on the targets. clear_only: attach only the targets with a recorded clear (rp_flush). 0 = nothing to attach (the pass is skipped, as nvn_mtl.m skips one with no texture)
 static int rp_begin(int clear_only) {
     if (R.on) return 1;
@@ -754,6 +764,8 @@ static int rp_begin(int clear_only) {
     for (int i = 0; i < R.n; i++) {
         vkn_img *e = R.ce[i]; VkImageView v;
         if (!e || (clear_only && !R.clear_c[i]) || !(v = vkn_img_view(e, R.clv[i], R.cly[i], 0))) continue;
+        if (e->pc && !R.clear_c[i]) {   // a deferred clear of this level and layer becomes the load op; of another, it is recorded first
+            if ((e->pc & 1) && e->pc_lv == R.clv[i] && e->pc_ly == R.cly[i]) { R.clear_c[i] = 1; R.cc[i] = e->pcv.color; e->pc = 0; g_stat_pend[1]++; } else pend_rec(e, 1); }
         ca[i].imageView = v; ca[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca[i].loadOp = R.clear_c[i] ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE; ca[i].clearValue.color = R.cc[i];
         ex[i] = lv_ext(e, R.clv[i]); if (ex[i].width < w) w = ex[i].width; if (ex[i].height < h) h = ex[i].height;
@@ -762,6 +774,13 @@ static int rp_begin(int clear_only) {
     }
     vkn_img *de = R.de; VkImageView dv = VK_NULL_HANDLE;
     if (de && (!clear_only || R.clear_d || R.clear_s) && (dv = vkn_img_view(de, R.dlv, R.dly, 0))) {
+        if (de->pc) {   // as for colour: per aspect, the recorded clear wins
+            if (de->pc_lv == R.dlv && de->pc_ly == R.dly) {
+                if ((de->pc & 2) && !R.clear_d) { R.clear_d = 1; R.cd = de->pcv.depthStencil.depth; }
+                if ((de->pc & 4) && !R.clear_s) { R.clear_s = 1; R.cs = de->pcv.depthStencil.stencil; }
+                de->pc = 0; g_stat_pend[1]++;
+            } else pend_rec(de, 1);
+        }
         VkClearValue cv; cv.depthStencil.depth = R.cd; cv.depthStencil.stencil = R.cs;
         if (de->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { has_d = 1; da.imageView = dv; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; da.loadOp = R.clear_d ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
                                                       da.storeOp = VK_ATTACHMENT_STORE_OP_STORE; da.clearValue = cv; g_stat_fold += R.clear_d; }
@@ -801,9 +820,10 @@ static int rp_begin(int clear_only) {
 static int g_pl_on;   // DM_VK_PASSLOG's frame is being replayed: pass ends are logged with the line that ended them
 static void rp_end_at(int line) { if (R.on) { vk.vkCmdEndRendering(cb_now()); R.on = 0; if (g_pl_on) NLOG("passlog   pass of c0=ser%llu ended at nvn_vk.c:%d", (unsigned long long)(R.n ? R.cser[0] : 0), line); } }
 #define rp_end() rp_end_at(__LINE__)
-static void rp_flush_at(int line) {   // recorded clears with no draw land in a pass of their own; an open pass ends
+static int clears_defer(void);
+static void rp_flush_at(int line) {   // recorded clears with no draw are deferred (clears_defer) or land in a pass of their own; an open pass ends
     int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
-    if (pend && !R.on) rp_begin(1);
+    if (pend && !R.on && !clears_defer()) rp_begin(1);
     rp_end_at(line);
 }
 #define rp_flush() rp_flush_at(__LINE__)
@@ -820,6 +840,51 @@ static void xfer_barrier(vkn_img *e, VkImageLayout to, VkAccessFlags2 da, uint32
     (void)lv; (void)ly; (void)nly;   // the whole image: one tracked layout each
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
     vk.vkCmdPipelineBarrier2(cb_now(), &di); e->rec = to;
+}
+// Records e's deferred clear (outside a pass: an open one ends first); locked: the caller holds vkn_tmu
+static void pend_rec(vkn_img *e, int locked) {
+    if (!e || !e->pc) return;
+    uint8_t pc = e->pc; e->pc = 0;
+    for (int i = 0; i < g_npend; i++) if (g_pend[i] == e->serial) { g_pend[i] = g_pend[--g_npend]; break; }
+    if (R.on) { rp_end(); g_stat_pend[3]++; } else g_stat_pend[2]++;
+    if (locked) use_mark(e); else { pthread_mutex_lock(&vkn_tmu); use_mark(e); pthread_mutex_unlock(&vkn_tmu); }
+    xfer_barrier(e, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_2_TRANSFER_WRITE_BIT, e->pc_lv, e->pc_ly, 1);
+    VkImageSubresourceRange r = {0, e->pc_lv, 1, e->pc_ly, 1};
+    if (pc & 1) { r.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vk.vkCmdClearColorImage(cb_now(), e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &e->pcv.color, 1, &r); }
+    else { r.aspectMask = (pc & 2 ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (pc & 4 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0); vk.vkCmdClearDepthStencilImage(cb_now(), e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &e->pcv.depthStencil, 1, &r); }
+}
+static void pend_resolve(vkn_img *e) { pend_rec(e, 0); }
+static void pend_all(void) {   // every deferred clear (images released since are dropped)
+    while (g_npend) {
+        uint64_t ser = g_pend[g_npend - 1];
+        pthread_mutex_lock(&vkn_tmu); vkn_img *e = vkn_img_get(ser); pthread_mutex_unlock(&vkn_tmu);
+        if (e && e->pc && !e->dead) pend_resolve(e); else { if (e) e->pc = 0; g_npend--; }
+    }
+}
+// Keeps a full clear of e's level lv layer ly (bits as pc) for later; 0 = not kept (the caller records it). A deferred clear of another level or layer is recorded first
+static int pend_set(vkn_img *e, uint8_t bits, uint32_t lv, uint32_t ly, const VkClearValue *v) {
+    if (!fold_on() || !e || !(e->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
+    if (e->pc && (e->pc_lv != lv || e->pc_ly != ly || ((e->pc | bits) & 1) != (bits & 1))) pend_resolve(e);
+    if (!e->pc) {
+        if (g_npend == (int)(sizeof g_pend / sizeof *g_pend)) pend_all();
+        g_pend[g_npend++] = e->serial; e->pc_lv = lv; e->pc_ly = ly;
+    }
+    if (bits & 1) e->pcv.color = v->color;
+    if (bits & 2) e->pcv.depthStencil.depth = v->depthStencil.depth;
+    if (bits & 4) e->pcv.depthStencil.stencil = v->depthStencil.stencil;
+    e->pc |= bits; g_stat_pend[0]++;
+    return 1;
+}
+// rp_flush with recorded clears and no pass: each target's clear is deferred (all or none: 0 leaves them recorded)
+static int clears_defer(void) {
+    if (!fold_on()) return 0;
+    for (int i = 0; i < R.n && i < 8; i++) if (R.clear_c[i] && (!R.ce[i] || !(R.ce[i]->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))) return 0;
+    if ((R.clear_d || R.clear_s) && R.de && !(R.de->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
+    for (int i = 0; i < R.n && i < 8; i++) if (R.clear_c[i]) { VkClearValue v; v.color = R.cc[i]; pend_set(R.ce[i], 1, R.clv[i], R.cly[i], &v);
+                                                               pthread_mutex_lock(&vkn_tmu); memcpy(R.ce[i]->clear, R.cc[i].float32, sizeof R.ce[i]->clear); R.ce[i]->cleared = 1; pthread_mutex_unlock(&vkn_tmu); }
+    if ((R.clear_d || R.clear_s) && R.de) { VkClearValue v; v.depthStencil.depth = R.cd; v.depthStencil.stencil = R.cs; pend_set(R.de, (uint8_t)((R.clear_d ? 2 : 0) | (R.clear_s ? 4 : 0)), R.dlv, R.dly, &v); }
+    clears_reset();
+    return 1;
 }
 static int buf_host(VkDeviceSize n, VkBufferUsageFlags u, VkBuffer *b, VkDeviceMemory *m, void **map);
 static int b_use(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail);
@@ -839,6 +904,7 @@ static void op_copy_t2t(const p_copy_t2t *c) {
     vkn_img *s = xfer_img(c->src, 0), *d = xfer_img(c->dst, 1);
     if (d) d->fb_ok = 0;   // its feedback copy is no longer current (fb_copy)
     pthread_mutex_unlock(&vkn_tmu);
+    pend_resolve(s); pend_resolve(d);
     if (!s || !d) { NRED_ONCE("COPY_T2T: the %s (ser=%llu) has no host image: the copy is skipped", !s ? "source" : "destination", (unsigned long long)(!s ? (c->src ? c->src->serial : 0) : (c->dst ? c->dst->serial : 0))); return; }
     if (!(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(d->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || s->aspect != d->aspect) {
         NRED_ONCE("COPY_T2T ser=%llu → ser=%llu: formats %d → %d cannot be copied on this device (usage or aspect): skipped", (unsigned long long)s->serial, (unsigned long long)d->serial, s->fmt, d->fmt); return; }
@@ -878,7 +944,10 @@ static void op_clear_tex(const p_clear_tex *c) {
     uint32_t n = (uint32_t)(c->r.depth > 1 ? c->r.depth : 1);
     if (lv >= e->levels || ly + n > e->layers) { NRED_ONCE("CLEAR_TEX: a level or layer beyond a host image: skipped"); return; }
     VkExtent2D x = lv_ext(e, lv);
-    if ((c->mask & 0xF) != 0xF || c->r.xoffset > 0 || c->r.yoffset > 0 || (uint32_t)c->r.width < x.width || (uint32_t)c->r.height < x.height)
+    int whole = (c->mask & 0xF) == 0xF && c->r.xoffset <= 0 && c->r.yoffset <= 0 && (uint32_t)c->r.width >= x.width && (uint32_t)c->r.height >= x.height;
+    if (whole && n == 1) { VkClearValue cv; memcpy(&cv.color, c->c.u, sizeof cv.color); if (pend_set(e, 1, lv, ly, &cv)) return; }   // float or integer bits alike
+    pend_resolve(e);
+    if (!whole)
         NRED_ONCE("CLEAR_TEX of part of a level or of some channels (mask %#x, region %dx%d at %d,%d of %ux%u): the whole level is cleared", (unsigned)c->mask, c->r.width, c->r.height, c->r.xoffset, c->r.yoffset, x.width, x.height);
     xfer_barrier(e, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_2_TRANSFER_WRITE_BIT, lv, ly, n);
     VkClearColorValue v; memcpy(&v, c->c.u, sizeof v);   // float or integer bits alike (is_uint: the integer form)
@@ -1131,6 +1200,7 @@ static VkImageView fb_copy(vkn_img *e, int stencil) {
                                                             v = getenv("DM_VK_FEEDBACK_REUSE"); reuse = !(v && *v == '0'); }
     int ds = e->aspect != VK_IMAGE_ASPECT_COLOR_BIT;
     if (!on || (ds && (!don || !(e->aspect & (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT)))) || !(e->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || e->depth > 1) return VK_NULL_HANDLE;
+    pend_resolve(e);
     uint64_t ep = g_fb_ep ^ atomic_load(&g_present_n) << 32; uint8_t part = stencil && ds ? 2 : 1;
     if (reuse && e->fbi && (e->fb_ok & part) && e->fb_ep == ep) { g_stat_fb[2]++; use_mark(e); return stencil && ds ? e->fbsv : e->fbv; }
     if (!e->fbi) {
@@ -1309,6 +1379,7 @@ static VkImageView tex_lookup(int tid, int want, int comp, int *why, int st) {
     if (v && want >= 0 && vc != comp && !raw) { if (why) *why = TL_COMP; v = VK_NULL_HANDLE; }   // the view's class (a stencil view reads unsigned integers), not the image format's
     pthread_mutex_unlock(&vkn_tmu);
     if (!e && !ts && !TSA(TS_STALE, 1)) NLOG("texture ID %d holds texture ser=%llu, already finalized (first case): an empty slot", tid, (unsigned long long)r.t.serial);
+    if (v && e->pc) pend_resolve(e);   // a deferred clear lands before it is sampled
     if (v && !tex_ready(e, cpu, ts, &r.t, want >= 0, st)) { VkImageView f = want >= 0 ? fb_copy(e, vc == 1) : VK_NULL_HANDLE; if (!f && why) *why = TL_FEED; v = f; }   // its own pass's target: the twin (fb_copy), else zeros
     return v;
 }
@@ -2400,7 +2471,7 @@ static void op_dispatch(const p_dispatch *d) {
     { const char *e = getenv("DM_VK_CS_SKIP"); if (e && strstr(e, sh->key)) { static int n; if (n++ < 4) NLOG("DM_VK_CS_SKIP: compute shader %s not run", sh->key); DS(g_disp_skip, 1); return; } }
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     g_disp_dim[0] = (uint32_t)d->x; g_disp_dim[1] = (uint32_t)d->y; g_disp_dim[2] = (uint32_t)d->z;
-    rp_flush();
+    rp_flush(); pend_all();   // its storage images and buffers: whatever it reads or writes sees the clears
     draw_tex_prep();
     VkDescriptorImageInfo ii[VKN_MAXB]; VkDescriptorBufferInfo bi[VKN_MAXB]; VkWriteDescriptorSet wr[VKN_MAXB]; vkn_img *imgs[VKN_MAXB]; int ni = 0;
     g_in_dispatch = 1; int ok = cs_binds(sh, ii, bi, wr, imgs, &ni); g_in_dispatch = 0;
@@ -2436,6 +2507,7 @@ static void op_copy_b2t(const p_copy_b2t *c) {
     const tex_t *t = c->tex;
     rp_flush();
     pthread_mutex_lock(&vkn_tmu); vkn_img *e = xfer_img(t, 1); pthread_mutex_unlock(&vkn_tmu);
+    pend_resolve(e);
     if (!e) { NRED_ONCE("COPY_B2T: texture ser=%llu format %#x has no host image: the copy is skipped", (unsigned long long)t->serial, t->d.format); return; }
     if (!(e->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || e->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { NRED_ONCE("COPY_B2T: texture ser=%llu (format %d) cannot be copied into on this device: skipped", (unsigned long long)e->serial, e->fmt); return; }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh), dbpp = 0, dec = vkn_bc_decoded((int)e->nvn_fmt, &dbpp);
@@ -2781,7 +2853,7 @@ uint64_t mtl_sub_commit(void) {
         pthread_mutex_lock(&g_mu); s->value = v; g_ncommit++; pthread_cond_signal(&g_ccv); pthread_mutex_unlock(&g_mu);
         return v;
     }
-    rp_flush();   // an open pass or recorded clears land in this submission's command buffer (cb_now: g_cur, still s)
+    rp_flush(); pend_all();   // an open pass, recorded and deferred clears land in this submission's command buffer (cb_now: g_cur, still s)
     vk.vkEndCommandBuffer(s->cb);
     g_cur = NULL;
     uint64_t vb = atomic_load(&g_fence) + 1;   // this submission's value (only this thread moves g_fence): the shadows' last use
@@ -2820,8 +2892,8 @@ void mtl_finish(void) { uint64_t f = atomic_load(&g_fence); while (!mtl_wait(f, 
 static void surf_report(const char *why);
 static void vkn_report(const char *why) {   // the backend's own line beside the surface one: what reached the GPU
     pthread_mutex_lock(&vkn_tmu); uint64_t ni = g_nimg, ib = g_img_b, gp = g_ghost_puts; pthread_mutex_unlock(&vkn_tmu);
-    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu, clears in a pass %llu, oversize clears in a pass of their own %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
-         (unsigned long long)atomic_load(&g_present_n), why, (unsigned long long)atomic_load(&g_fence), (unsigned long long)g_stat_pass, (unsigned long long)g_stat_fold, (unsigned long long)g_stat_clr_mid,
+    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu (deferred %llu: taken by a pass %llu, recorded between passes %llu / after ending one %llu), clears in a pass %llu, oversize clears in a pass of their own %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
+         (unsigned long long)atomic_load(&g_present_n), why, (unsigned long long)atomic_load(&g_fence), (unsigned long long)g_stat_pass, (unsigned long long)g_stat_fold, (unsigned long long)g_stat_pend[0], (unsigned long long)g_stat_pend[1], (unsigned long long)g_stat_pend[2], (unsigned long long)g_stat_pend[3], (unsigned long long)g_stat_clr_mid,
          (unsigned long long)g_stat_own, (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)g_stat_sr_more, (unsigned long long)g_stat_sr_split, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
 }
 #define STATS_FROM 60   // no statistics line before this present: the parity cut ends at the host's own line of present 1 or 2 (parity.py PRESENT), and lines before it must be the HLE's alone
