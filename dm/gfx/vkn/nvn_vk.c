@@ -767,8 +767,10 @@ static int g_fold_on = -1;
 static int fold_on(void) { if (g_fold_on < 0) { const char *e = getenv("DM_VK_CLEAR_FOLD"); g_fold_on = !(e && *e == '0'); if (!g_fold_on) NLOG("DM_VK_CLEAR_FOLD=0: clears are recorded where they come"); } return g_fold_on; }
 static uint64_t g_pend[64]; static int g_npend;   // the serials of the images with a deferred clear
 static uint64_t g_stat_pend[4];   // deferred, taken as a load op, recorded between passes, recorded after ending a pass
+static uint64_t g_stat_dsn[2];   // loaded depth / stencil attachments not stored (rp_begin: no draw of the pass writes them)
 static void pend_rec(vkn_img *e, int locked);
 // Opens the pass on the targets. clear_only: attach only the targets with a recorded clear (rp_flush). 0 = nothing to attach (the pass is skipped, as nvn_mtl.m skips one with no texture)
+static unsigned ds_scan(void);
 static int rp_begin(int clear_only) {
     if (R.on) return 1;
     if (!R.has_rt) { NRED_ONCE("a draw or clear with no render target set: skipped"); clears_reset(); return 0; }
@@ -802,6 +804,15 @@ static int rp_begin(int clear_only) {
                                                       da.storeOp = VK_ATTACHMENT_STORE_OP_STORE; da.clearValue = cv; g_stat_fold += R.clear_d; }
         if (de->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { has_s = 1; sa.imageView = dv; sa.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; sa.loadOp = R.clear_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
                                                         sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE; sa.clearValue = cv; g_stat_fold += R.clear_s; }
+        // A loaded depth or stencil that no draw or clear of the pass can write is not stored (STORE_OP_NONE, core in 1.3: the store leaves it as it is). On a tiler the store is a
+        // full write of the image back to memory: Paper Mario: The Thousand-Year Door's 960x540 depth-stencil is loaded by ~20 passes a frame that only test against it (the
+        // characters' shadows, lighting). Opt-in, DM_VK_DS_STORE=1: on the RG 476H ~16 depth and ~3.5 stencil loads a frame were not stored, yet the frame stayed 39.8 → 39.6-39.8 ms (Mali seems to skip
+        // unchanged tiles itself). ds_scan reads ahead to the pass's end. DM_VK_DIAG=dsnone (wrong on purpose, a bound): a loaded depth / stencil is never stored (39.7 → 37.0 ms, the
+        // characters vanish: the gain is in passes that write depth)
+        { static int on = -1, dsn; if (on < 0) { const char *x = getenv("DM_VK_DS_STORE"); on = x && *x == '1'; x = getenv("DM_VK_DIAG"); dsn = x && strstr(x, "dsnone"); }
+          unsigned w = dsn ? 0 : !on ? 3 : clear_only ? 0 : (has_d && !R.clear_d) || (has_s && !R.clear_s) ? ds_scan() : 3;
+          if (has_d && !R.clear_d && !(w & 1)) { da.storeOp = VK_ATTACHMENT_STORE_OP_NONE; g_stat_dsn[0]++; }
+          if (has_s && !R.clear_s && !(w & 2)) { sa.storeOp = VK_ATTACHMENT_STORE_OP_NONE; g_stat_dsn[1]++; } }
         ex[8] = lv_ext(de, R.dlv); if (ex[8].width < w) w = ex[8].width; if (ex[8].height < h) h = ex[8].height;
         att_barrier(&b[nb++], de); any = 1; R.att_ds = 1; R.dsf = de->fmt;
     }
@@ -1219,6 +1230,8 @@ static VkImageView fb_copy(vkn_img *e, int stencil) {
     pend_resolve(e);
     uint64_t ep = g_fb_ep ^ atomic_load(&g_present_n) << 32; uint8_t part = stencil && ds ? 2 : 1;
     if (reuse && e->fbi && (e->fb_ok & part) && e->fb_ep == ep) { g_stat_fb[2]++; use_mark(e); return stencil && ds ? e->fbsv : e->fbv; }
+    { static int st = -1; if (st < 0) { const char *x = getenv("DM_VK_DIAG"); st = x && strstr(x, "fbstale"); }   // DM_VK_DIAG=fbstale (wrong on purpose, a bound): a twin once made is never copied again
+      if (st && e->fbi && e->fb_ok) { g_stat_fb[2]++; use_mark(e); return stencil && ds ? e->fbsv : e->fbv; } }
     if (!e->fbi) {
         VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, e->fmt, {e->w, e->h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
@@ -1798,6 +1811,46 @@ static void state_op(uint32_t op, const uint8_t *a) {   // nvn_mtl.m's state_op 
         case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)(const void *)a)->on; break;
         default: break;
     }
+}
+// The records being run (exec_run, one per call depth) and the submission's command handles after the current one (mtl_exec_rest): ds_scan reads ahead from them
+static const uint8_t *g_xp[32]; static int g_xd;
+static const uint64_t *g_rest; static int g_nrest;
+void mtl_exec_rest(const uint64_t *h, int n) { g_rest = h; g_nrest = n; }
+static unsigned ds_writes(const ds_st *ds, const uint32_t wm[2]) {   // bits 1 depth, 2 stencil: what a draw with this state may write (NVN stencil ops 1..8, 1 = keep; others as keep, as draw_pso)
+    unsigned w = ds->dt && ds->dw ? 1 : 0;
+    if (ds->st) { const unsigned o[2][3] = {{ds->fail_f, ds->zfail_f, ds->zpass_f}, {ds->fail_b, ds->zfail_b, ds->zpass_b}};
+        for (int f = 0; f < 2; f++) if (wm[f] & 0xff) for (int i = 0; i < 3; i++) if (o[f][i] >= 2 && o[f][i] <= 8) w |= 2; }
+    return w;
+}
+// What the pass beginning at the current record may write of its depth target, bits as ds_writes: from that record (the draw or clear that opens it) on, with the bound state as it
+// changes, until a SET_RT of another depth target (no pass keeps its depth across that: rt_sub) or the submission's end (mtl_sub_commit ends the pass). Ends that come sooner
+// (a copy, a barrier, a split) only make the scan longer than the pass: what it finds is still all the pass can write. A clear of depth / stencil counts as both; past 8192 records, both
+static unsigned ds_scan(void) {
+    if (g_xd < 1 || g_xd > 32) return 3;
+    const uint8_t *stk[32]; int d = g_xd - 1, nr = 0; memcpy(stk, g_xp, sizeof(*stk) * (size_t)g_xd);
+    const uint8_t *p = stk[d]; ds_st ds = S.ds; uint32_t wm[2] = {S.st_wmask[0], S.st_wmask[1]}; unsigned w = 0;
+    for (int n = 0; n < 8192; n++) {
+        op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8;
+        switch (h.op) {
+            case OP_END:
+                if (d > 0) { p = stk[--d]; memcpy(&h, p, sizeof h); p += h.size; continue; }   // after the caller's CALL
+                if (nr < g_nrest) { p = (const uint8_t *)(uintptr_t)g_rest[nr++]; continue; }
+                return w;
+            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (d >= 31) return 3; stk[d++] = p; p = (const uint8_t *)(uintptr_t)t; continue; }
+            case OP_BIND_STATE: { const p_bind_state *b = (const void *)a; if (b->kind == 5) memcpy(&ds, b->bytes, sizeof ds); break; }
+            case OP_STENCIL: { const p_stencil *b = (const void *)a; if (b->which == 1) for (int f = 0; f < 2; f++) if (b->face & (1 << f)) wm[f] = (uint32_t)b->mask; break; }
+            case OP_DRAW: case OP_DRAW_IDX: w |= ds_writes(&ds, wm); if (w == 3) return 3; break;
+            case OP_CLEAR_DS: return 3;
+            case OP_SET_RT: { const p_set_rt *r = (const p_set_rt *)a; const tex_t *t = r->depth; uint64_t ser = t ? t->serial : 0;
+                uint32_t dl = t && r->has_dview && r->dview.set_levels ? r->dview.base_level : 0, dy = t && r->has_dview && r->dview.set_layers ? r->dview.min_layer : 0;
+                if (ser != R.dser || (ser && (dl != R.dlv || dy != R.dly))) return w;
+                break; }
+            default: break;
+        }
+        p += h.size;
+    }
+    return 3;
 }
 
 // Statistics (draw_report): draws recorded (indexed among them), skipped by why; pipelines made, their creation time, cache hits; descriptor pushes, writes, dummies; uniform bindings, those at
@@ -2780,7 +2833,6 @@ void mtl_sub_begin(void) {
     rt_reresolve();
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
-void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 // In submission order on the CPU, at once: later commands of the same submission see the bytes (on the GPU they run in order too).
 // The source must be pool memory as well: a sparse virtual pool's range stays PROT_NONE on Linux (hle_nvn.c vpool_map keeps its pages in the page table only), and reading it would kill the process
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
@@ -2805,13 +2857,15 @@ void mtl_sub_counter(uint64_t addr, uint32_t type) { post((post_op){2, NULL, 0, 
 // Paper Mario: The Thousand-Year Door on the RG 476H: the GPU waited for 8-9 ms of recording each frame; a part every 64 draws made 8 parts a frame that waited 2.5 ms each for one of the 4 submission slots (storybook 62 ms a frame against 47), every 400 draws gains 2-3 ms (storybook 44, Rogueport 34 against 35)
 static int split_at(void) { static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_SPLIT"); n = e && *e ? atoi(e) : 400; if (n != 400) NLOG("DM_VK_SPLIT=%d: %s", n, n ? "a part every that many draws" : "one submission per QueueSubmitCommands"); } return n; }
 static void exec_run(const uint8_t *p) {
+    int xd = g_xd++;
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
+        if (xd < 32) g_xp[xd] = p;
         const uint8_t *a = p + 8;
         surf_rec(&h, p, a);
         if (g_vk && !g_cur->failed) b_rec(&h, p, a);   // B: what this record reads as buffers, and its own command pages
         switch (h.op) {
-            case OP_END: return;
+            case OP_END: g_xd--; return;
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
             case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_run((const uint8_t *)(uintptr_t)t); break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
@@ -2908,9 +2962,9 @@ void mtl_finish(void) { uint64_t f = atomic_load(&g_fence); while (!mtl_wait(f, 
 static void surf_report(const char *why);
 static void vkn_report(const char *why) {   // the backend's own line beside the surface one: what reached the GPU
     pthread_mutex_lock(&vkn_tmu); uint64_t ni = g_nimg, ib = g_img_b, gp = g_ghost_puts; pthread_mutex_unlock(&vkn_tmu);
-    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu (deferred %llu: taken by a pass %llu, recorded between passes %llu / after ending one %llu), clears in a pass %llu, oversize clears in a pass of their own %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
+    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu (deferred %llu: taken by a pass %llu, recorded between passes %llu / after ending one %llu), clears in a pass %llu, oversize clears in a pass of their own %llu, depth / stencil not stored %llu / %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
          (unsigned long long)atomic_load(&g_present_n), why, (unsigned long long)atomic_load(&g_fence), (unsigned long long)g_stat_pass, (unsigned long long)g_stat_fold, (unsigned long long)g_stat_pend[0], (unsigned long long)g_stat_pend[1], (unsigned long long)g_stat_pend[2], (unsigned long long)g_stat_pend[3], (unsigned long long)g_stat_clr_mid,
-         (unsigned long long)g_stat_own, (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)g_stat_sr_more, (unsigned long long)g_stat_sr_split, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
+         (unsigned long long)g_stat_own, (unsigned long long)g_stat_dsn[0], (unsigned long long)g_stat_dsn[1], (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)g_stat_sr_more, (unsigned long long)g_stat_sr_split, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
 }
 #define STATS_FROM 60   // no statistics line before this present: the parity cut ends at the host's own line of present 1 or 2 (parity.py PRESENT), and lines before it must be the HLE's alone
 // The suspend path's bound (mtl_drain): Android calls it on the UI thread (front_android.c on_stop → dm_gfx_suspend), where a GPU that hangs must not hang the app into an ANR, the same 4 s as
