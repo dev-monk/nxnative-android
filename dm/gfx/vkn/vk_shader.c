@@ -597,6 +597,165 @@ static uint32_t *spv_idmap(const uint32_t *w, size_t nw, const vkn_shader *sh, s
 }
 static uint32_t g_shid;
 // The SPIR-V's SHA-256 against the reflection's spv_sha256: its first 8 bytes, 16 lowercase hex digits (dmsh_build_vk.py: of the decompressed module)
+// A compute shader as a fragment shader (nvn_vk.c csf_run runs its dispatch as one triangle over its storage images as colour attachments: an image a dispatch writes needs storage usage,
+// and on Mali that keeps it uncompressed for every later pass). Taken only where that is the same computation: each storage image (2D, one layer, float texels) is written once, in the
+// entry function outside any selection or loop and before any return, at (WorkgroupId.xy * LocalSize.xy + LocalInvocationId.xy), proven from the words (constants, bitcasts, adds,
+// multiplies and shifts by constants, Function variables stored once before the load); no barrier, workgroup memory, subgroup operation, other built-in or image read; SPIR-V 1.3 at
+// most (later versions list Private variables in the interface). The writes become stores to outputs (location k: the k-th storage image by binding); WorkgroupId and
+// LocalInvocationId become Private variables filled first from FragCoord (its pixel / LocalSize, and the remainder; z 0). The same as tools/cs2fs.py, which checks it with spirv-val.
+// Returns the module (malloc) or NULL with why. DM_VK_CS_FRAG=0: not done (=<dir>: modules from there instead, vkn_shader_frag)
+enum { CS_MAXO = 8 };
+typedef struct { int64_t c, g[2], l[2]; } cs_lf;   // a linear form of the group and local ids
+static int cs_lin(const uint32_t *w, const size_t *def, const uint32_t *stv, const size_t *stp, const uint8_t *stn, uint32_t bound, uint32_t wg, uint32_t li, uint32_t id, size_t at, cs_lf *o, int d) {
+    memset(o, 0, sizeof *o);
+    if (d > 64 || !id || id >= bound || !def[id]) return 0;
+    const uint32_t *x = &w[def[id]]; uint32_t op = x[0] & 0xffff; cs_lf a, b;
+    if (op == 43) { o->c = (int32_t)x[3]; return 1; }   // OpConstant (32-bit)
+    if (op == 124 || op == 83) return cs_lin(w, def, stv, stp, stn, bound, wg, li, x[3], at, o, d + 1);   // OpBitcast, OpCopyObject
+    if (op == 61) {   // OpLoad: of a built-in's component, or of a Function variable stored once before
+        uint32_t p = x[3]; if (p >= bound || !def[p]) return 0;
+        const uint32_t *y = &w[def[p]]; uint32_t pop = y[0] & 0xffff;
+        if (pop == 65 && (y[0] >> 16) == 5 && (y[3] == wg || y[3] == li) && y[4] < bound && def[y[4]] && (w[def[y[4]]] & 0xffff) == 43) {
+            uint32_t ax = w[def[y[4]] + 3]; if (ax > 2) return 0; if (ax < 2) { if (y[3] == wg) o->g[ax] = 1; else o->l[ax] = 1; } return 1; }   // z is 0
+        if (pop == 59 && y[3] == 7 && stn[p] == 1 && stp[p] < def[id]) return cs_lin(w, def, stv, stp, stn, bound, wg, li, stv[p], stp[p], o, d + 1);
+        return 0;
+    }
+    if (op == 128 || op == 132 || op == 196) {   // OpIAdd, OpIMul, OpShiftLeftLogical
+        if (!cs_lin(w, def, stv, stp, stn, bound, wg, li, x[3], at, &a, d + 1) || !cs_lin(w, def, stv, stp, stn, bound, wg, li, x[4], at, &b, d + 1)) return 0;
+        int bc = !b.g[0] && !b.g[1] && !b.l[0] && !b.l[1], ac = !a.g[0] && !a.g[1] && !a.l[0] && !a.l[1];
+        if (op == 128) { o->c = a.c + b.c; for (int k = 0; k < 2; k++) { o->g[k] = a.g[k] + b.g[k]; o->l[k] = a.l[k] + b.l[k]; } return 1; }
+        if (op == 196 && (!bc || b.c < 0 || b.c > 30)) return 0;
+        int64_t m = op == 196 ? (int64_t)1 << b.c : bc ? b.c : a.c; cs_lf *v = op == 196 || bc ? &a : &b;
+        if (op == 132 && !bc && !ac) return 0;
+        o->c = v->c * m; for (int k = 0; k < 2; k++) { o->g[k] = v->g[k] * m; o->l[k] = v->l[k] * m; } return 1;
+    }
+    return 0;
+}
+static uint32_t *spv_cs2fs(const uint32_t *w, size_t nw, const vkn_shader *sh, size_t *onw, int *nout, char *why, size_t wn) {
+    #define CS_NO(...) do { snprintf(why, wn, __VA_ARGS__); goto fail; } while (0)
+    uint32_t bound = w[3], main_fn = 0, lsz[3] = {0}, wg = 0, li = 0, nimg = 0, ivar[CS_MAXO], ibind[CS_MAXO], iload[64], nload = 0, wdone[CS_MAXO] = {0}, wval[CS_MAXO];
+    size_t first_fn = 0, main_at = 0, main_end = 0, *def = NULL, *stp = NULL; uint32_t *stv = NULL, *rty = NULL, *o = NULL; uint8_t *stn = NULL; size_t on = 0, cap = 0;
+    if (w[1] > 0x00010300u) CS_NO("SPIR-V %u.%u (1.3 at most)", w[1] >> 16 & 0xff, w[1] >> 8 & 0xff);
+    def = calloc(bound, sizeof *def); stp = calloc(bound, sizeof *stp); stv = calloc(bound, sizeof *stv); rty = calloc(bound, sizeof *rty); stn = calloc(bound, 1);
+    if (!def || !stp || !stv || !rty || !stn) CS_NO("out of memory");
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (!wc || i + wc > nw) CS_NO("malformed");
+        if (op == 15) { if (main_fn || w[i + 1] != 5) CS_NO("not one GLCompute entry point"); main_fn = w[i + 2]; }
+        if (op == 16 && w[i + 1] == main_fn) { if (w[i + 2] == 17 && wc == 6) { lsz[0] = w[i + 3]; lsz[1] = w[i + 4]; lsz[2] = w[i + 5]; } else CS_NO("execution mode %u", w[i + 2]); }
+        if (op == 71 && wc >= 4 && w[i + 2] == 11) { if (w[i + 3] == 26) wg = w[i + 1]; else if (w[i + 3] == 27) li = w[i + 1]; else CS_NO("built-in %u", w[i + 3]); }
+        if (op == 224 || op == 225 || (op >= 259 && op <= 275) || (op >= 333 && op <= 366) || (op >= 4421 && op <= 4432) || op == 60) CS_NO("a barrier, subgroup operation or image texel pointer (opcode %u)", op);
+        if (op == 59 && w[i + 3] == 4) CS_NO("workgroup memory");
+        if ((op >= 21 && op <= 23) || op == 25 || op == 32) def[w[i + 1]] = i;   // types: result first
+        else if (op == 43 || op == 59 || op == 61 || op == 65 || op == 80 || op == 83 || op == 124 || op == 128 || op == 132 || op == 196) { if (w[i + 2] < bound) def[w[i + 2]] = i; }
+        if (op == 54 && !first_fn) first_fn = i;
+        if (op == 54 && w[i + 2] == main_fn) main_at = i;
+        if (op == 56 && main_at && !main_end) main_end = i;
+        if (op == 62 && w[i + 1] < bound) { if (stn[w[i + 1]] < 2) stn[w[i + 1]]++; stv[w[i + 1]] = w[i + 2]; stp[w[i + 1]] = i; }
+        if (first_fn && wc >= 3 && !(op == 62 || op == 99 || op == 63 || op == 64 || (op >= 245 && op <= 255 && op != 245) || op == 8 || op == 317 || op == 56 || op == 224 || op == 225) && w[i + 2] < bound) rty[w[i + 2]] = w[i + 1];
+        i += wc;
+    }
+    if (!main_fn || !main_at || !main_end) CS_NO("no entry function");
+    if (!lsz[0] || !lsz[1] || lsz[2] != 1 || lsz[0] > 64 || lsz[1] > 64) CS_NO("local size %ux%ux%u", lsz[0], lsz[1], lsz[2]);
+    for (int b = 0; b < sh->nb; b++) if (!vd.frag_stores && sh->b[b].kind == VKN_B_SBUF) CS_NO("storage buffers, and no fragment stores on this device");
+    // storage images: UniformConstant variables of a 2D, single-layer, single-sample image of Sampled 2, by binding
+    for (size_t i = 5; i < first_fn; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 59 && w[i + 3] == 0 && def[w[i + 1]]) { const uint32_t *pt = &w[def[w[i + 1]]]; uint32_t t = pt[3];
+            if (t < bound && def[t] && (w[def[t]] & 0xffff) == 25) { const uint32_t *im = &w[def[t]];
+                if (im[7] == 2) {
+                    if (im[3] != 1 || im[5] || im[6]) CS_NO("a storage image that is not plain 2D");
+                    if (nimg == CS_MAXO) CS_NO("more than %d storage images", CS_MAXO);
+                    uint32_t bi = UINT32_MAX; for (size_t j = 5; j < first_fn; ) { if ((w[j] & 0xffff) == 71 && w[j + 1] == w[i + 2] && w[j + 2] == 33) bi = w[j + 3]; j += w[j] >> 16; }
+                    uint32_t k = nimg++; while (k && ibind[k - 1] > bi) { ivar[k] = ivar[k - 1]; ibind[k] = ibind[k - 1]; k--; } ivar[k] = w[i + 2]; ibind[k] = bi; } } }
+        i += wc; }
+    if (!nimg) CS_NO("no storage image");
+    // their uses: loads only, each load used only as an OpImageWrite's image; the writes
+    { size_t depth = 0, ret = 0; uint32_t merge[64];
+      for (size_t i = first_fn; i < nw; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; int inm = i > main_at && i < main_end;
+        if (inm && op == 248) while (depth && merge[depth - 1] == w[i + 1]) depth--;
+        if (inm && (op == 247 || op == 246)) { if (depth == 64) CS_NO("constructs nested too deep"); merge[depth++] = w[i + 1]; }
+        if (inm && (op == 252 || op == 253 || op == 254 || op == 255 || op == 4416)) ret = 1;
+        int isload = 0; for (uint32_t k = 0; k < nimg; k++) if (op == 61 && w[i + 3] == ivar[k]) { if (nload == 64) CS_NO("too many loads of a storage image"); iload[nload++] = w[i + 2] | k << 24; isload = 1; }
+        for (uint32_t a = 1; a < wc && !isload; a++) {
+            for (uint32_t k = 0; k < nimg; k++) if (w[i + a] == ivar[k]) CS_NO("a storage image used other than loaded (opcode %u)", op);
+            for (uint32_t k = 0; k < nload; k++) if (w[i + a] == (iload[k] & 0xffffff) && !(op == 99 && a == 1)) CS_NO("a storage image read or queried (opcode %u)", op);
+        }
+        if (op == 99) { uint32_t k = UINT32_MAX;
+            for (uint32_t j = 0; j < nload; j++) if (w[i + 1] == (iload[j] & 0xffffff)) k = iload[j] >> 24;
+            if (k == UINT32_MAX) CS_NO("an image write not of a storage image variable");
+            if (!inm) CS_NO("a storage image written outside the entry function");
+            if (depth || ret) CS_NO("a storage image written in a selection or loop, or after a return");
+            if (wdone[k]) CS_NO("a storage image written twice");
+            uint32_t c = w[i + 2]; if (c >= bound || !def[c] || (w[def[c]] & 0xffff) != 80 || (w[def[c]] >> 16) != 5) CS_NO("a write coordinate not built from two components");
+            for (int ax = 0; ax < 2; ax++) { cs_lf f;
+                if (!cs_lin(w, def, stv, stp, stn, bound, wg, li, w[def[c] + 3 + ax], i, &f, 0) || f.c || f.g[ax] != lsz[ax] || f.l[ax] != 1 || f.g[!ax] || f.l[!ax])
+                    CS_NO("a write coordinate %c that is not the invocation's pixel", "xy"[ax]); }
+            uint32_t vt = w[i + 3] < bound ? rty[w[i + 3]] : 0, vd4 = vt && def[vt] ? def[vt] : 0;
+            if (!vd4 || (w[vd4] & 0xffff) != 23 || w[vd4 + 3] != 4 || !def[w[vd4 + 2]] || (w[def[w[vd4 + 2]]] & 0xffff) != 22 || w[def[w[vd4 + 2]] + 2] != 32) CS_NO("a texel that is not a float vec4");
+            wdone[k] = 1; wval[k] = vt; }
+        i += wc; } }
+    for (uint32_t k = 0; k < nimg; k++) if (!wdone[k]) CS_NO("a storage image never written");
+    if ((wg && (!def[wg] || w[def[wg] + 3] != 1)) || (li && (!def[li] || w[def[li] + 3] != 1))) CS_NO("a built-in that is not an Input variable");
+    // the types it needs (found, or new ids defined before the first function)
+    uint32_t nd[192]; size_t nnd = 0;
+    #define CS_FIND(pred) ({ uint32_t r_ = 0; for (size_t j = 5; j < first_fn && !r_; ) { const uint32_t *q = &w[j]; uint32_t qop = q[0] & 0xffff, qwc = q[0] >> 16; (void)qop; (void)qwc; if (pred) r_ = qop == 43 || qop == 59 ? q[2] : q[1]; j += qwc; } r_; })
+    #define CS_NEW(id, ...) do { uint32_t t_[] = {__VA_ARGS__}; id = bound++; nd[nnd++] = (uint32_t)(sizeof t_ / sizeof *t_ + 1) << 16 | t_[0]; nd[nnd++] = id; for (size_t q_ = 1; q_ < sizeof t_ / sizeof *t_; q_++) nd[nnd++] = t_[q_]; } while (0)
+    uint32_t f32 = CS_FIND(qop == 22 && qwc == 3 && q[2] == 32), u32 = CS_FIND(qop == 21 && qwc == 4 && q[2] == 32 && !q[3]);
+    if (!f32) CS_NEW(f32, 22, 32);
+    if (!u32) CS_NEW(u32, 21, 32, 0);
+    uint32_t v4f = CS_FIND(qop == 23 && q[2] == f32 && q[3] == 4), v2f = CS_FIND(qop == 23 && q[2] == f32 && q[3] == 2), v2u = CS_FIND(qop == 23 && q[2] == u32 && q[3] == 2), v3u = CS_FIND(qop == 23 && q[2] == u32 && q[3] == 3);
+    if (!v4f) CS_NEW(v4f, 23, f32, 4);
+    if (!v2f) CS_NEW(v2f, 23, f32, 2);
+    if (!v2u) CS_NEW(v2u, 23, u32, 2);
+    if (!v3u) CS_NEW(v3u, 23, u32, 3);
+    for (uint32_t k = 0; k < nimg; k++) if (wval[k] != v4f) CS_NO("a texel that is not a float vec4");
+    if ((wg && w[def[w[def[wg] + 1]] + 3] != v3u) || (li && w[def[w[def[li] + 1]] + 3] != v3u)) CS_NO("a built-in that is not a uint vec3");
+    uint32_t pin4, pout4, ppv3, ppu, cx, cy, c0, fc, ov[CS_MAXO];
+    CS_NEW(pin4, 32, 1, v4f); CS_NEW(pout4, 32, 3, v4f); CS_NEW(ppv3, 32, 6, v3u); CS_NEW(ppu, 32, 6, u32);
+    CS_NEW(cx, 43, u32, lsz[0]); { uint32_t t = nd[nnd - 3]; nd[nnd - 3] = nd[nnd - 2]; nd[nnd - 2] = t; }   // OpConstant: type before result
+    CS_NEW(cy, 43, u32, lsz[1]); { uint32_t t = nd[nnd - 3]; nd[nnd - 3] = nd[nnd - 2]; nd[nnd - 2] = t; }
+    CS_NEW(c0, 43, u32, 0); { uint32_t t = nd[nnd - 3]; nd[nnd - 3] = nd[nnd - 2]; nd[nnd - 2] = t; }
+    fc = bound++; nd[nnd++] = 4u << 16 | 59; nd[nnd++] = pin4; nd[nnd++] = fc; nd[nnd++] = 1;   // the Input FragCoord
+    for (uint32_t k = 0; k < nimg; k++) { ov[k] = bound++; nd[nnd++] = 4u << 16 | 59; nd[nnd++] = pout4; nd[nnd++] = ov[k]; nd[nnd++] = 3; }
+    if (wg) { nd[nnd++] = 4u << 16 | 59; nd[nnd++] = ppv3; nd[nnd++] = wg; nd[nnd++] = 6; }
+    if (li) { nd[nnd++] = 4u << 16 | 59; nd[nnd++] = ppv3; nd[nnd++] = li; nd[nnd++] = 6; }
+    #undef CS_NEW
+    #undef CS_FIND
+    // the rewrite
+    cap = nw + nnd + 64 + 8 * nimg; o = malloc(cap * sizeof *o); if (!o) CS_NO("out of memory");
+    #define CS_PUT(...) do { uint32_t t_[] = {__VA_ARGS__}; for (size_t q_ = 0; q_ < sizeof t_ / sizeof *t_; q_++) o[on++] = t_[q_]; } while (0)
+    memcpy(o, w, 5 * sizeof *o); on = 5;
+    int deco = 0, init = 0, inmain = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; const uint32_t *x = &w[i]; i += wc;
+        if (on + wc + nnd + 64 > cap) { cap = cap * 2 + wc + nnd; uint32_t *p = realloc(o, cap * sizeof *o); if (!p) CS_NO("out of memory"); o = p; }
+        int img = 0; for (uint32_t k = 0; k < nimg; k++) img |= (op == 59 && x[2] == ivar[k]) || ((op == 5 || op == 71) && x[1] == ivar[k]) || (op == 61 && x[3] == ivar[k]);
+        if (img || (op == 59 && (x[2] == wg || x[2] == li) && wg | li) || (op == 71 && (x[1] == wg || x[1] == li))) continue;
+        if (op == 17 && (x[1] == 55 || x[1] == 56)) continue;   // StorageImage{Read,Write}WithoutFormat
+        if (op == 15) { CS_PUT((5 + 1 + nimg) << 16 | 15, 4, main_fn, 0x6e69616du, 0, fc); for (uint32_t k = 0; k < nimg; k++) o[on++] = ov[k]; continue; }
+        if (op == 16 && x[1] == main_fn) { CS_PUT(3u << 16 | 16, main_fn, 7); continue; }   // OriginUpperLeft
+        if (op == 71 && !deco) { deco = 1; CS_PUT(4u << 16 | 71, fc, 11, 15); for (uint32_t k = 0; k < nimg; k++) CS_PUT(4u << 16 | 71, ov[k], 30, k); }
+        if (op == 54 && x == &w[first_fn]) { memcpy(&o[on], nd, nnd * sizeof *o); on += nnd; }
+        if (op == 54) inmain = x[2] == main_fn;
+        if (op == 99) { uint32_t k = 0; for (uint32_t j = 0; j < nload; j++) if (x[1] == (iload[j] & 0xffffff)) k = iload[j] >> 24; CS_PUT(3u << 16 | 62, ov[k], x[3]); continue; }
+        if (inmain && !init && op != 54 && op != 55 && op != 248 && op != 59) {   // after main's label and variables: the pixel into the built-ins
+            init = 1; uint32_t t0 = bound++, t1 = bound++, t2 = bound++, px = bound++, py = bound++, gx = bound++, gy = bound++, lx = bound++, ly = bound++;
+            CS_PUT(4u << 16 | 61, v4f, t0, fc, 7u << 16 | 79, v2f, t1, t0, t0, 0, 1, 4u << 16 | 109, v2u, t2, t1, 5u << 16 | 81, u32, px, t2, 0, 5u << 16 | 81, u32, py, t2, 1,
+                   5u << 16 | 134, u32, gx, px, cx, 5u << 16 | 134, u32, gy, py, cy, 5u << 16 | 137, u32, lx, px, cx, 5u << 16 | 137, u32, ly, py, cy);
+            if (wg) { uint32_t v = bound++; CS_PUT(6u << 16 | 80, v3u, v, gx, gy, c0, 3u << 16 | 62, wg, v); }
+            if (li) { uint32_t v = bound++; CS_PUT(6u << 16 | 80, v3u, v, lx, ly, c0, 3u << 16 | 62, li, v); }
+        }
+        memcpy(&o[on], x, wc * sizeof *o);
+        if (op == 65 && (x[3] == wg || x[3] == li) && wg | li) o[on + 1] = ppu;   // a built-in's component: now a Private pointer
+        on += wc;
+    }
+    #undef CS_PUT
+    if (!deco || !init) CS_NO("no decoration or no entry block");
+    o[3] = bound; *onw = on; *nout = (int)nimg;
+    free(def); free(stp); free(stv); free(rty); free(stn); return o;
+fail:
+    free(def); free(stp); free(stv); free(rty); free(stn); free(o); return NULL;
+    #undef CS_NO
+}
 static int sha_ok(const void *spv, size_t n, const char *want) {
     uint8_t d[32]; char hx[17];
     if (strlen(want) != 16) return 0;
@@ -615,6 +774,25 @@ static void spv_ovr(const char *hk, uint32_t **spv, size_t *nbytes, uint32_t **o
     if (b && fread(b, 1, (size_t)n, f) == (size_t)n && b[0] == 0x07230203u) { *spv = *ovr = b; *nbytes = (size_t)n; static int nl; if (nl++ < 4) VLOG("shader %s: SPIR-V from %s (DM_VK_SPV_OVR)", hk, fp); }
     else free(b);
     fclose(f);
+}
+// A compute shader's fragment form for nvn_vk.c's csf_run: made with the module (spv_cs2fs), or with DM_VK_CS_FRAG=<dir> read from <dir>/<key>.spv at the first dispatch instead
+// (tools/cs2fs.py's output, location k the k-th storage image by binding: an experiment without rebuilding). DM_VK_CS_FRAG=0: none (every dispatch is dispatched)
+static int cs_frag_mode(void) {   // 0 off, 1 made here (spv_cs2fs, the default), 2 from DM_VK_CS_FRAG's directory
+    static int m = -1; if (m < 0) { const char *e = getenv("DM_VK_CS_FRAG"); m = !e || !*e ? 1 : !strcmp(e, "0") ? 0 : !strcmp(e, "1") ? 1 : 2; }
+    return m;
+}
+VkShaderModule vkn_shader_frag(vkn_shader *sh) {
+    const char *d = getenv("DM_VK_CS_FRAG");
+    if (cs_frag_mode() != 2 || sh->fmod || sh->fbad) return cs_frag_mode() ? sh->fmod : VK_NULL_HANDLE;
+    char fp[1024]; size_t n = 0; snprintf(fp, sizeof fp, "%s/%s.spv", d, sh->key);
+    uint32_t *w = (uint32_t *)slurp(fp, &n); sh->fbad = 1;
+    if (w && n > 20 && n % 4 == 0 && w[0] == 0x07230203u) {
+        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, n, w};
+        VkResult r = vk.vkCreateShaderModule(vd.dev, &ci, NULL, &sh->fmod);
+        if (r) VLOG("[RED] compute shader %s: its fragment form %s cannot be made (VkResult %d): it is dispatched", sh->key, fp, r); else { sh->fbad = 0; VLOG("compute shader %s: fragment form from %s (DM_VK_CS_FRAG)", sh->key, fp); }
+    } else VLOG("compute shader %s: no fragment form at %s (DM_VK_CS_FRAG): it is dispatched", sh->key, fp);
+    free(w);
+    return sh->fmod;
 }
 // A module from its reflection text and SPIR-V (words, patched in place). NULL = refused (said once, with why)
 static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, uint32_t *spv, size_t nbytes, int zst) {
@@ -643,9 +821,23 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
             if (idm && sh->dyn && (stage == 1 || stage == 5)) { size_t in = mn; uint32_t *p = spv_idmap(ms, in, sh, &mn, &nfix); if (p) { if (ms != spv) free(ms); ms = p; sh->idmap = nfix; } else mn = in; }
             { const char *dd = getenv("DM_VK_IDMAP_DUMP"); if (dd && *dd && ms != spv) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_IDMAP_DUMP=<dir>: the rewritten modules, for spirv-val
             { const char *dd = getenv("DM_VK_SPV_DUMP"); if (dd && *dd) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_SPV_DUMP=<dir>: every module as handed to the driver, after all patches (malioc)
+            for (size_t i = 5; stage == 5 && i < mn && ms[i] >> 16; i += ms[i] >> 16)   // the local size (OpExecutionMode, LocalSize)
+                if ((ms[i] & 0xffff) == 16 && (ms[i] >> 16) == 6 && i + 5 < mn && ms[i + 2] == 17) { sh->lsz[0] = ms[i + 3]; sh->lsz[1] = ms[i + 4]; sh->lsz[2] = ms[i + 5]; }
             VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, mn * 4, ms};
             VkResult r = vk.vkCreateShaderModule(vd.dev, &ci, NULL, &sh->mod);
             if (r) snprintf(why, sizeof why, "vkCreateShaderModule: %d", r);
+            if (!r && stage == 5 && cs_frag_mode() == 1) {   // its fragment form (spv_cs2fs), for the dispatch as a pass
+                size_t fn = 0; int no = 0; char fw[160] = ""; uint32_t *f = spv_cs2fs(ms, mn, sh, &fn, &no, fw, sizeof fw);
+                if (f) {
+                    VkShaderModuleCreateInfo fi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fn * 4, f};
+                    VkResult fr = vk.vkCreateShaderModule(vd.dev, &fi, NULL, &sh->fmod);
+                    if (fr) { sh->fmod = VK_NULL_HANDLE; snprintf(fw, sizeof fw, "vkCreateShaderModule: %d", fr); }
+                    { const char *dd = getenv("DM_VK_SPV_DUMP"); if (dd && *dd) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s_fs.spv", dd, hk); FILE *df = fopen(fp, "wb"); if (df) { fwrite(f, 4, fn, df); fclose(df); } } }
+                    free(f);
+                }
+                if (sh->fmod) VLOG("compute shader %s: its dispatches run as a pass (its %d storage images written at its invocations' pixels: colour outputs)", hk, no);
+                else { sh->fbad = 1; VLOG("compute shader %s: dispatched (not as a pass: %s)", hk, fw); }
+            }
             if (sh->idmap) { static int nl; if (nl++ < 4) VLOG("shader %s: %d array index clamps look up the bound slots' handles (a handle read from memory; first cases)", hk, nfix); }
             if (ms != spv) free(ms);
         }

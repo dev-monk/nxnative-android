@@ -268,7 +268,7 @@ int vkn_dev_init(void) {
     // BC textures sampled natively where the device has them (vk_bc.c decodes them on the CPU otherwise); DM_VK_BC_NATIVE=0 decodes them anyway
     { const char *e = getenv("DM_VK_BC_NATIVE"); if (f2.features.textureCompressionBC && !(e && *e == '0')) { w2.features.textureCompressionBC = VK_TRUE; vd.bc_native = 1; } }
     // Storage buffers the vertex and pixel shaders write (nvn_vk.c draw_sbuf), where the device has the features
-    if (f2.features.fragmentStoresAndAtomics) w2.features.fragmentStoresAndAtomics = VK_TRUE;
+    if (f2.features.fragmentStoresAndAtomics) { w2.features.fragmentStoresAndAtomics = VK_TRUE; vd.frag_stores = 1; }
     if (f2.features.vertexPipelineStoresAndAtomics) w2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
     // Storage images of Unknown format (dm/android/tools/spv_add_caps.py declares StorageImage{Read,Write}WithoutFormat for them: Paper Mario: The Thousand-Year Door's compute shaders);
     // DM_VK_NOFMT=0 leaves the features off, and vk_shader.c then refuses those modules

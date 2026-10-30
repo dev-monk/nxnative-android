@@ -38,6 +38,13 @@ static _Atomic uint64_t g_pval;   // the present timeline's last signalled value
 static _Atomic(VkSemaphore) g_ptl;
 static VkSemaphore ptl(void) { return atomic_load_explicit(&g_ptl, memory_order_acquire); }
 static VkSampler g_samp; static VkDescriptorSetLayout g_dsl; static VkPipelineLayout g_pl; static VkDescriptorPool g_dp; static VkShaderModule g_vs, g_fs;
+// The present's vertex shader on its own, for nvn_vk.c's passes that cover their targets with one triangle (csf_run: a dispatch as a fragment pass; uv unused). Submit thread
+VkShaderModule vkn_tri_vs(void) {
+    static VkShaderModule m;
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof present_vert_spv, present_vert_spv};
+    if (!m && vk.vkCreateShaderModule(vd.dev, &ci, NULL, &m)) m = VK_NULL_HANDLE;
+    return m;
+}
 // The present pipelines by their parameters (specialization constants): a few kept, so a crop that alternates (or a format change and back) does not recompile; the least recently used goes
 #define NPC 4
 typedef struct { VkFormat fmt; int32_t rot; float p[8]; } pkey;   // p: U0 V0 US VS (the vertex stage), then the clamp X0 Y0 X1 Y1 (the fragment stage); no padding, compared with memcmp

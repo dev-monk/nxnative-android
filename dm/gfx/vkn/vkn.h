@@ -60,6 +60,7 @@ typedef struct {
     int aniso, mirror, minmax;           // samplerAnisotropy, samplerMirrorClampToEdge, samplerFilterMinmax are on (where the device has them: nvn_vk.c samp_make says a sampler that needs a missing one)
     int port, port_bias, port_swz;       // VK_KHR_portability_subset is on (required where the driver has it), with its samplerMipLodBias / imageViewFormatSwizzle features; every feature it
                                          // offers is enabled, and nvn_vk.c avoids a use whose feature is absent (a LOD bias of 0, an identity view swizzle: said once)
+    int frag_stores;                     // fragmentStoresAndAtomics is on (vk_shader.c spv_cs2fs: a compute shader that writes buffers runs as a pass only with it)
     int push; uint32_t max_push;         // VK_KHR_push_descriptor is on, and its maxPushDescriptors (the draws' one set: nvn_vk.c)
     int clip_ctl;                        // VK_EXT_depth_clip_control's depthClipControl is on (near = -w: mtl_set_depth_zero)
     int depth_clamp, indep_blend, dual_src, bias_clamp, fill_ns;   // depthClamp, independentBlend, dualSrcBlend, depthBiasClamp, fillModeNonSolid are on
@@ -148,8 +149,13 @@ typedef struct vkn_shader {
     int dual;                                         // a pixel shader with an Output decorated Index other than 0 (dual-source blending's second colour)
     VkBuffer c1_buf; VkDeviceMemory c1_mem; uint32_t c1_n;
     VkDescriptorSetLayout cdsl; VkPipelineLayout cpl; VkPipeline cpso; int cbad;   // a compute shader's own layout and pipeline (nvn_vk.c op_dispatch); cbad: they cannot be made
+    uint32_t lsz[3];                                  // a compute shader's local size (its LocalSize execution mode)
+    VkShaderModule fmod; int fbad, nfp;               // its fragment-shader form (DM_VK_CS_FRAG, vkn_shader_frag) and the pass's own layout and pipelines, by attachment formats (nvn_vk.c csf_run)
+    VkDescriptorSetLayout fdsl; VkPipelineLayout fpl; struct { VkFormat f[8]; uint32_t n; VkPipeline p; } fp[4];
 } vkn_shader;
 int vkn_shmap_stage(const uint8_t key[8]);           // the shader map's NVN stage of a key, -1 = not in it
 vkn_shader *vkn_shader_get(const uint8_t key[8], int stage);   // NULL = refused or missing (said once)
+VkShaderModule vkn_tri_vs(void);                    // vk_present.c's vertex shader: one triangle over the viewport
+VkShaderModule vkn_shader_frag(vkn_shader *sh);     // a compute shader's fragment-shader form from DM_VK_CS_FRAG's directory, VK_NULL_HANDLE = none (said once)
 vkn_shader *vkn_shader_add(const uint8_t key[8], int stage, const char *json, const uint32_t *spv, size_t nbytes);   // t_vkn's modules
 void vkn_shader_stats(uint64_t *loaded, uint64_t *refused);

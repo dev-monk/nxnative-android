@@ -2614,8 +2614,9 @@ static int nofmt_write_ok(VkFormat fmt) {
     if (n < 16) { c[n].f = fmt; c[n++].ok = ok; }
     return ok;
 }
-// A dispatch's descriptor writes (as a draw's, stage 5) and its storage images (imgs, ni). 0 = the dispatch is skipped (said)
-static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescriptorBufferInfo *bi, VkWriteDescriptorSet *wr, vkn_img **imgs, int *ni) {
+// A dispatch's descriptor writes (as a draw's, stage 5) and its storage images (imgs, ni). 0 = the dispatch is skipped (said). frag (csf_run): the storage images are not resolved here
+// and their writes are left with no descriptor (descriptorCount 0)
+static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescriptorBufferInfo *bi, VkWriteDescriptorSet *wr, vkn_img **imgs, int *ni, int frag) {
     g_dyn_n = 0;
     for (int i = 0; i < sh->nb; i++) { const vkn_sbind *b = &sh->b[i];
         wr[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, b->binding, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, NULL, NULL};
@@ -2623,7 +2624,8 @@ static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescripto
             VkImageView v = draw_view(5, sh, b); VkSampler sm = draw_samp(5, b);
             if (!v) { v = g_dview[b->comp][b->vt]; DS(g_ddum, 1); static int n; if (n++ < 12) NLOG("dispatch of compute shader %s: texture slot %u (texture ID %d) reads the dummy (first cases)", sh->key, b->reg, (int)(T.tex[5][b->reg] & 0xfffff)); }
             ii[i] = (VkDescriptorImageInfo){sm ? sm : g_dsamp, v, SR_LAYOUT}; wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[i].pImageInfo = &ii[i];
-        } else if (b->kind == VKN_B_IMG) {
+        } else if (b->kind == VKN_B_IMG && frag) wr[i].descriptorCount = 0;
+        else if (b->kind == VKN_B_IMG) {
             int tid = (int)(S.img[5][b->reg] & 0xfffff); vkn_img *e = NULL; VkImageView v = VK_NULL_HANDLE;
             // The handle's registration may be a view of one level or layer (a mip chain written level by level: Paper Mario: The Thousand-Year Door's 8x8-group pass binds one
             // texture three times, as levels 0-2); writing level 0 through all three lost the GPU on the RG 476H
@@ -2705,6 +2707,124 @@ static void cs_storage_prep(const vkn_shader *sh) {
         pthread_mutex_unlock(&vkn_tmu); pthread_mutex_unlock(&vkn_qmu);
     }
 }
+// ---- A dispatch as a fragment pass (DM_VK_CS_FRAG=0: never) ----
+// A compute shader that writes each of its storage images once, at its own invocation's pixel, has a fragment form (vk_shader.c spv_cs2fs checks that and makes it): its dispatch runs
+// as one triangle over those images as colour attachments instead. A dispatch's images need storage usage, and on Mali that keeps them uncompressed (no AFBC) for every later pass
+// that reads or draws into them: Paper Mario: The Thousand-Year Door lights its 960x540 scene this way into the two images the rest of the frame draws on (RESEARCH_mali_shaders.md:
+// 34.1 → 32.4 ms a frame on the RG 476H). The images must have one extent, which the pass covers; the groups must cover it with none wholly outside it (that group's other effects,
+// a buffer write, would be lost). Where they do not, where an image has an integer format, where the dispatch samples one of its images, or where something cannot be made, it is
+// dispatched (said)
+static uint64_t g_csf_n, g_csf_no;
+static int csf_no(vkn_shader *sh, int perm, const char *why) {
+    if (perm) sh->fbad = 1;
+    if (g_csf_no++ < 8) NLOG("%scompute shader %s: dispatched, not run as a pass (%s)", perm ? "[RED] " : "", sh->key, why);
+    return 0;
+}
+static VkPipeline csf_pso(vkn_shader *sh, const VkFormat *cf, uint32_t nc) {
+    for (int i = 0; i < sh->nfp; i++) if (sh->fp[i].n == nc && !memcmp(sh->fp[i].f, cf, nc * sizeof *cf)) return sh->fp[i].p;
+    if (sh->nfp == 4 || !vkn_tri_vs()) return VK_NULL_HANDLE;
+    if (!sh->fpl) {   // the compute layout's bindings but the storage images', for the fragment stage
+        VkDescriptorSetLayoutBinding b[VKN_MAXB]; uint32_t n = 0;
+        for (int i = 0; i < sh->nb; i++) if (sh->b[i].kind != VKN_B_IMG) b[n++] = (VkDescriptorSetLayoutBinding){sh->b[i].binding, bind_type(&sh->b[i]), bind_count(&sh->b[i]), VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, vkd_layout_flags(), n, b};
+        VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};
+        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &sh->fdsl, sh->idmap ? 1 : 0, &pr};
+        if (vk.vkCreateDescriptorSetLayout(vd.dev, &di, NULL, &sh->fdsl)) return VK_NULL_HANDLE;
+        if (vk.vkCreatePipelineLayout(vd.dev, &pi, NULL, &sh->fpl)) { sh->fpl = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    }
+    VkPipelineShaderStageCreateInfo stg[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vkn_tri_vs(), "main", NULL},
+                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, sh->fmod, "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_FALSE, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState ba[8];
+    for (uint32_t i = 0; i < nc; i++) ba[i] = (VkPipelineColorBlendAttachmentState){VK_FALSE, 0, 0, 0, 0, 0, 0, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY, nc, ba, {0, 0, 0, 0}};
+    static const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, nc, cf, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, 2, stg, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, sh->fpl, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
+    VkPipeline p; uint64_t t0 = now_ns();
+    if (vk.vkCreateGraphicsPipelines(vd.dev, g_pcache, 1, &gi, NULL, &p)) return VK_NULL_HANDLE;
+    NLOG("compute shader %s: its pass's pipeline (%u colour attachments) made in %.2f ms", sh->key, nc, (now_ns() - t0) / 1e6);
+    memcpy(sh->fp[sh->nfp].f, cf, nc * sizeof *cf); sh->fp[sh->nfp].n = nc; sh->fp[sh->nfp].p = p;
+    return sh->fp[sh->nfp++].p;
+}
+// 1 = the dispatch ran as a pass; 0 = it is to be dispatched. After rp_flush, pend_all and draw_tex_prep
+static int csf_run(vkn_shader *sh, const p_dispatch *d) {
+    if (sh->fbad || !vkn_shader_frag(sh)) return 0;
+    uint32_t lx = sh->lsz[0], ly = sh->lsz[1];
+    if (!lx || !ly || sh->lsz[2] != 1) return csf_no(sh, 1, "its local size is not 2D");
+    if (d->z != 1) return csf_no(sh, 0, "a dispatch more than one group deep");
+    const vkn_sbind *ob[8]; uint32_t no = 0;   // its storage images by binding: output location k is the k-th (tools/cs2fs.py)
+    for (int i = 0; i < sh->nb; i++) { if (sh->b[i].kind != VKN_B_IMG) continue;
+        if (no == 8) return csf_no(sh, 1, "more than 8 storage images");
+        uint32_t k = no++; while (k && ob[k - 1]->binding > sh->b[i].binding) { ob[k] = ob[k - 1]; k--; } ob[k] = &sh->b[i]; }
+    vkn_img *oe[8]; uint32_t olv[8], oly[8]; VkExtent2D ex = {0, 0}, oex[8];
+    for (uint32_t k = 0; k < no; k++) {
+        int tid = (int)(S.img[5][ob[k]->reg] & 0xfffff); uint64_t ser = 0; tex_t tt; uint32_t lv = 0, ly0 = 0;
+        pthread_mutex_lock(&g_rmu);
+        if (tid && tid < g_ntreg && g_treg[tid].ok) { const treg_t *r = &g_treg[tid]; ser = r->t.serial; tt = r->t;
+            if (r->has_v && r->v.set_levels) lv = r->v.base_level; if (r->has_v && r->v.set_layers) ly0 = r->v.min_layer; }
+        pthread_mutex_unlock(&g_rmu);
+        pthread_mutex_lock(&vkn_tmu);
+        vkn_img *e = ser ? vkn_img_get(ser) : NULL; if (ser && !e) e = img_make(&tt, "a compute shader's output, as a target", NVK_RT);
+        int ok = e && e->aspect == VK_IMAGE_ASPECT_COLOR_BIT && att_ok(e) && lv < e->levels && ly0 < e->layers && e->depth <= 1; if (ok) use_mark(e);
+        pthread_mutex_unlock(&vkn_tmu);
+        if (!ok) return csf_no(sh, 0, "an image it writes is no colour target here");
+        if (fmt_comp(e->fmt)) return csf_no(sh, 0, "an image it writes has an integer format (the outputs are floats)");
+        oe[k] = e; olv[k] = lv; oly[k] = ly0; oex[k] = lv_ext(e, lv);
+        if (k && (oex[k].width != ex.width || oex[k].height != ex.height)) return csf_no(sh, 0, "the images it writes differ in extent (the pass covers one)");
+        ex = oex[k];
+    }
+    if ((uint64_t)d->x * lx < ex.width || (uint64_t)(d->x - 1) * lx >= ex.width || (uint64_t)d->y * ly < ex.height || (uint64_t)(d->y - 1) * ly >= ex.height)
+        return csf_no(sh, 0, "its groups do not cover its images' extent, or some lie outside it");
+    VkDescriptorImageInfo ii[VKN_MAXB]; VkDescriptorBufferInfo bi[VKN_MAXB]; VkWriteDescriptorSet wr[VKN_MAXB]; int ni = 0;
+    g_in_dispatch = 1; int ok = cs_binds(sh, ii, bi, wr, NULL, &ni, 1); g_in_dispatch = 0;
+    if (!ok) return 0;   // said there; the dispatch says it again and is skipped
+    uint32_t nw = 0;
+    for (int w = 0; w < sh->nb; w++) {
+        if (!wr[w].descriptorCount) continue;
+        if (wr[w].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || wr[w].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+            for (uint32_t a = 0; a < wr[w].descriptorCount; a++) for (uint32_t k = 0; k < no; k++) {
+                const vkn_img *e = oe[k]; VkImageView q = wr[w].pImageInfo[a].imageView;
+                for (int v = 0; v < e->nviews; v++) if (e->views[v].v == q) return csf_no(sh, 0, "it samples an image it writes");
+                for (int v = 0; v < e->nsviews; v++) if (e->sviews[v].v == q) return csf_no(sh, 0, "it samples an image it writes");
+            }
+        wr[nw++] = wr[w];
+    }
+    VkFormat cf[8]; for (uint32_t k = 0; k < no; k++) cf[k] = oe[k]->fmt;
+    VkPipeline p = csf_pso(sh, cf, no);
+    if (!p) return csf_no(sh, 1, "its pass's pipeline cannot be made");
+    VkRenderingAttachmentInfo ca[8]; VkImageMemoryBarrier2 b[8];
+    pthread_mutex_lock(&vkn_tmu);
+    for (uint32_t k = 0; k < no; k++) {
+        VkImageView v = vkn_img_view(oe[k], olv[k], oly[k], 0);
+        if (!v) { pthread_mutex_unlock(&vkn_tmu); return csf_no(sh, 0, "an attachment view cannot be made"); }
+        ca[k] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, v, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        ca[k].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;   // every pixel is written
+        ca[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    pthread_mutex_unlock(&vkn_tmu);
+    VkCommandBuffer cb = cb_now();
+    vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); D.valid = 0;   // the draws' cached state is not the command buffer's now
+    if (nw && !vkd_write_bp(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sh->fpl, sh->fdsl, nw, wr)) return 0;
+    if (sh->idmap) draw_idmap(cb, sh->fpl, VK_SHADER_STAGE_FRAGMENT_BIT, 5);
+    for (uint32_t k = 0; k < no; k++) att_barrier(&b[k], oe[k]);
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT};   // what it reads, and its buffer writes after earlier ones
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb, 0, NULL, no, b};
+    vk.vkCmdPipelineBarrier2(cb, &di);
+    VkViewport vp = {0, 0, (float)ex.width, (float)ex.height, 0, 1}; VkRect2D sc = {{0, 0}, ex};
+    vk.vkCmdSetViewport(cb, 0, 1, &vp); vk.vkCmdSetScissor(cb, 0, 1, &sc);
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, sc, 1, 0, no, ca, NULL, NULL};
+    vk.vkCmdBeginRendering(cb, &ri); vk.vkCmdDraw(cb, 3, 1, 0, 0); vk.vkCmdEndRendering(cb);
+    mem_barrier(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);   // its buffer writes; the images go by their tracked layout
+    if (g_csf_n++ < 6) NLOG("dispatch %dx%d: compute shader %s run as a pass over %u images (%ux%u)", d->x, d->y, sh->key, no, ex.width, ex.height);
+    return 1;
+}
 static void op_dispatch(const p_dispatch *d) {
     g_fb_ep++;   // what it writes is not tracked: every feedback copy is made again (fb_copy)
     static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_COMPUTE"); on = !(e && *e == '0'); if (!on) NLOG("DM_VK_COMPUTE=0: dispatches are not run"); }
@@ -2718,10 +2838,12 @@ static void op_dispatch(const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     g_disp_dim[0] = (uint32_t)d->x; g_disp_dim[1] = (uint32_t)d->y; g_disp_dim[2] = (uint32_t)d->z;
     rp_flush(); pend_all();   // its storage images and buffers: whatever it reads or writes sees the clears
+    draw_tex_prep();
+    if (csf_run(sh, d)) return;
     cs_storage_prep(sh);
     draw_tex_prep();
     VkDescriptorImageInfo ii[VKN_MAXB]; VkDescriptorBufferInfo bi[VKN_MAXB]; VkWriteDescriptorSet wr[VKN_MAXB]; vkn_img *imgs[VKN_MAXB]; int ni = 0;
-    g_in_dispatch = 1; int ok = cs_binds(sh, ii, bi, wr, imgs, &ni); g_in_dispatch = 0;
+    g_in_dispatch = 1; int ok = cs_binds(sh, ii, bi, wr, imgs, &ni, 0); g_in_dispatch = 0;
     if (!ok) { DS(g_disp_skip, 1); return; }
     VkCommandBuffer cb = cb_now();
     for (int k = 0; k < ni; k++) {   // the storage images into the general layout, after everything before wrote them
