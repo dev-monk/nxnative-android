@@ -83,6 +83,7 @@ typedef struct vkn_img {
     VkImageLayout layout;                // as of the last submission handed to the queue (under g_qmu); the present restores it after sampling
     VkImageLayout rec;                   // as the submission being recorded leaves it (submit thread); published to layout at the commit
     uint64_t rec_sub;                    // the submission rec belongs to
+    VkPipelineStageFlags2 sr_st;         // while rec is the sampled layout: the stages made ready for it (nvn_vk.c tex_ready)
     uint64_t use_nvn, use_pres;          // the NVN timeline / present timeline value of its last use: destroyed once both have completed
     struct { uint32_t key; VkImageView v; } views[16]; int nviews;   // attachment views by level << 16 | layer, and the present's (key ~0)
     float clear[4]; int cleared;         // the last colour clear landed on it (the present logs it: what the screen should show)

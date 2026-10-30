@@ -681,9 +681,10 @@ static struct {
 static uint64_t g_sub_id;                          // this submission (vkn_img.rec_sub)
 static vkn_img **g_touch; static int g_ntouch, g_touchcap;   // images whose layout this submission tracks (published at commit)
 static VkCommandBuffer cb_now(void) { return g_cur->cb; }
+#define SR_STAGES (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
 static VkImageLayout rec_layout(vkn_img *e) {
     if (e->rec_sub != g_sub_id) {
-        e->rec_sub = g_sub_id; e->rec = e->layout;   // the submit thread is the only writer of layout (at commit), so this read needs no lock
+        e->rec_sub = g_sub_id; e->rec = e->layout; e->sr_st = SR_STAGES;   // the submit thread is the only writer of layout (at commit), so this read needs no lock
         if (g_ntouch == g_touchcap) { g_touchcap = g_touchcap ? g_touchcap * 2 : 64; g_touch = realloc(g_touch, (size_t)g_touchcap * sizeof *g_touch); if (!g_touch) die("vkn backend: touch list allocation failed"); }
         g_touch[g_ntouch++] = e;
     }
@@ -990,7 +991,6 @@ enum { TS_UP1, TS_RE, TS_REALW, TS_UP1_B, TS_RE_B, TS_REALW_B, TS_EDGE, TS_ZERO,
 static _Atomic uint64_t g_ts[TS_N];
 #define TSA(i, n) atomic_fetch_add_explicit(&g_ts[i], (uint64_t)(n), memory_order_relaxed)
 #define SR_LAYOUT VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-#define SR_STAGES (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
 
 // A view's component mapping from the NVN swizzle. Under the portability subset without imageViewFormatSwizzle (VUID-VkImageViewCreateInfo-imageViewFormatSwizzle-04465) a view must map
 // each component to itself: the identity, said once (the RGBX formats' alpha of one and a view's own swizzle are then the shader's to apply, which no slice does yet)
@@ -1149,19 +1149,37 @@ static VkImageView fb_copy(vkn_img *e) {
     return e->fbv;
 }
 static int g_in_dispatch;   // op_dispatch is resolving its bindings: no pass is open, so the last pass's targets are no feedback loop
-static int tex_ready(vkn_img *e, int cpu, uintptr_t ts, const tex_t *t, int prog) {   // 0 = a target of the pass: not sampled (prog: a draw with a program samples it, which says it)
+// The stages a target drawn earlier in the submission is made ready for: the one that samples it (st: NVN's stage, 1 fragment, 5 compute, the others before rasterization; -1 all). Mali runs a pass's
+// vertex and tiling work beside the previous pass's fragment work; a barrier into the vertex stage after a pass that drew the texture stops that. Paper Mario: The Thousand-Year Door's
+// storybook alternates about 20 small blur passes, each sampling the last. A later use from a stage not yet covered adds a barrier for it. DM_VK_SRSTAGE=0: every sampling stage, as before;
+// DM_VK_SRSTAGE=ab:<frames>: off and on in alternate phases of that many frames (phase 0 off), to compare both in one run, scene and thermal state
+static VkPipelineStageFlags2 sr_stage(int st) {
+    static int on = -1; static uint64_t ab;
+    if (on < 0) { const char *e = getenv("DM_VK_SRSTAGE"); on = !(e && *e == '0'); if (e && !strncmp(e, "ab:", 3)) ab = strtoull(e + 3, NULL, 10);
+                  NLOG("%s", ab ? "DM_VK_SRSTAGE=ab: sampling-stage readiness alternates off / on by phase" : on ? "targets sampled later are made ready for the sampling stage only (DM_VK_SRSTAGE=0: all)" : "DM_VK_SRSTAGE=0: targets sampled later are made ready for every sampling stage"); }
+    int now = ab ? (int)(atomic_load(&g_present_n) / ab & 1) : on;
+    return !now || st < 0 ? SR_STAGES : st == 1 ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : st == 5 ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT;
+}
+static uint64_t g_stat_sr_more, g_stat_sr_split;   // barriers added for a stage the first one did not cover, and those of them that ended an open pass
+static const char *g_tl_from;     // DM_VK_DIAG=sr: which lookup asked (draw_view, draw_dyn, draw_texu, tex_bound)
+static int tex_ready(vkn_img *e, int cpu, uintptr_t ts, const tex_t *t, int prog, int st) {   // 0 = a target of the pass: not sampled (prog: a draw with a program samples it, which says it)
     int tgt = !g_in_dispatch && R.de == e; for (int i = 0; i < R.n && !g_in_dispatch; i++) tgt |= R.ce[i] == e;
     if (tgt) {
         if (!TSA(TS_FEED, 1) && !prog) NLOG("texture ser=%llu is bound while it is a target of the pass (first case): left as the target (a draw whose shader samples it is said in red)", (unsigned long long)e->serial);
         return 0;
     }
     if (e->rec_sub == g_sub_id) {
-        if (e->rec == SR_LAYOUT) return 1;
-        rp_end();
-        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, SR_STAGES, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VkPipelineStageFlags2 need = sr_stage(st);
+        if (e->rec == SR_LAYOUT && (e->sr_st & need) == need) return 1;
+        int was_on = R.on; rp_end();
+        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, need, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             e->rec, SR_LAYOUT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, e->img, {e->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
         VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
         vk.vkCmdPipelineBarrier2(cb_now(), &di);
+        if (e->rec == SR_LAYOUT) {
+            { static int dg = -1, n; if (dg < 0) { const char *x = getenv("DM_VK_DIAG"); dg = x && strstr(x, "sr"); }
+              if (dg && n++ < 40) NLOG("sr: ser=%llu %ux%u had stages %#llx, stage %d (%s) asks %#llx, pass %s, frame %llu", (unsigned long long)e->serial, e->w, e->h, (unsigned long long)e->sr_st, st, g_tl_from ? g_tl_from : "?", (unsigned long long)need, was_on ? "open" : "closed", (unsigned long long)atomic_load(&g_present_n)); }
+            e->sr_st |= need; g_stat_sr_more++; g_stat_sr_split += was_on; } else e->sr_st = need;
         e->rec = SR_LAYOUT; TSA(TS_LAY_CB, 1);
         return 1;
     }
@@ -1188,7 +1206,7 @@ static int tex_ready(vkn_img *e, int cpu, uintptr_t ts, const tex_t *t, int prog
     } else if (old == VK_IMAGE_LAYOUT_UNDEFINED && !e->up && tex_init_ok(e, t)) kind = TJ_INIT;
     if (!kind) kind = old == VK_IMAGE_LAYOUT_UNDEFINED ? (e->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT ? TJ_ZERO : TJ_LAYOUT) : old != SR_LAYOUT ? TJ_LAYOUT : TJ_NONE;
     if (kind) tj_add(e, old, kind);
-    e->rec = SR_LAYOUT;
+    e->rec = SR_LAYOUT; e->sr_st = SR_STAGES;
     return 1;
 }
 // The one-time fill from initial content (nvn_mtl.m tex_init_fill, the same tests): a texture nothing wrote, in a pool the CPU cannot access (what the storage held at
@@ -1227,7 +1245,7 @@ static int tex_init_ok(const vkn_img *e, const tex_t *t) {
 // want / comp: the view type and component type the shader declares (-1: a draw with no program, the view's own type); why: what an empty answer means when the texture exists
 // (1 a target of the pass, 2 a cube the shader wants and no host image is one, 3 a component type the image's format has not)
 enum { TL_FEED = 1, TL_CUBE, TL_COMP, TL_3D };
-static VkImageView tex_lookup(int tid, int want, int comp, int *why) {
+static VkImageView tex_lookup(int tid, int want, int comp, int *why, int st) {
     if (why) *why = 0;
     if (!tid) return VK_NULL_HANDLE;
     TSA(TS_TLOOK, 1);
@@ -1256,7 +1274,7 @@ static VkImageView tex_lookup(int tid, int want, int comp, int *why) {
     if (v && want >= 0 && vc != comp) { if (why) *why = TL_COMP; v = VK_NULL_HANDLE; }   // the view's class (a stencil view reads unsigned integers), not the image format's
     pthread_mutex_unlock(&vkn_tmu);
     if (!e && !ts && !TSA(TS_STALE, 1)) NLOG("texture ID %d holds texture ser=%llu, already finalized (first case): an empty slot", tid, (unsigned long long)r.t.serial);
-    if (v && !tex_ready(e, cpu, ts, &r.t, want >= 0)) { VkImageView f = want >= 0 ? fb_copy(e) : VK_NULL_HANDLE; if (!f && why) *why = TL_FEED; v = f; }   // its own pass's target: the twin (fb_copy), else zeros
+    if (v && !tex_ready(e, cpu, ts, &r.t, want >= 0, st)) { VkImageView f = want >= 0 ? fb_copy(e) : VK_NULL_HANDLE; if (!f && why) *why = TL_FEED; v = f; }   // its own pass's target: the twin (fb_copy), else zeros
     return v;
 }
 // Sampler parameters → a VkSampler (under g_rmu), as samp_by_id maps them: GL's filters (a min filter without mips: the base level, minLod 0 maxLod 0.25 so a minified sample stays minified),
@@ -1346,6 +1364,7 @@ static VkSampler samp_lookup_as(int sid, int integer) {
 static VkSampler samp_lookup(int sid) { return samp_lookup_as(sid, 0); }
 // A draw (compute 0: stages 0-4) or dispatch (compute 1: stage 5): the slots bound or changed since the last resolve, every bound one where something said all
 static void tex_bound(int compute) {
+    g_tl_from = "tex_bound";
     uint64_t g = atomic_load_explicit(&g_reg_gen, memory_order_acquire);
     if (g != T.gen) { T.gen = g; T.all = 0x3f; }
     for (int st = compute ? 5 : 0, se = compute ? 6 : 5; st < se; st++) {
@@ -1354,7 +1373,7 @@ static void tex_bound(int compute) {
             uint64_t m = T.tb[st][w] & (all ? ~0ull : T.td[st][w]); T.td[st][w] = 0;
             if (w < 2) T.tsd[st][w] &= ~m;
             while (m) { int s = w * 64 + __builtin_ctzll(m); m &= m - 1; uint64_t h = T.tex[st][s];
-                T.tv[st][s] = tex_lookup((int)(h & 0xfffff), -1, 0, NULL); T.tvt[st][s] = 0;
+                T.tv[st][s] = tex_lookup((int)(h & 0xfffff), -1, 0, NULL, st); T.tvt[st][s] = 0;
                 if (s < NVN_SEPTEX_SLOT0) T.ts[st][s] = samp_lookup((int)(h >> 20)); }
         }
         for (int w = 0; w < 2; w++) {
@@ -2155,10 +2174,11 @@ static int draw_drv2(int st, const vkn_shader *sh, VkDescriptorBufferInfo *o) {
 // A dynamic handle array's elements (TEXD: element k = the texture of combined slot k, else separate slot k, as the array's view type; one of another kind or none: the dummy;
 // SAMPD: the separate sampler of slot k, else the sampler half of combined slot k). out: b->n entries
 static void draw_dyn(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {
+    g_tl_from = "draw_dyn";
     for (int k = 0; k < b->n; k++) {
         if (b->kind == VKN_B_TEXD) {
             uint64_t h = k < 128 ? (T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; int tid = (int)(h & 0xfffff), why = 0;
-            VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why) : VK_NULL_HANDLE;
+            VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
             if (!v) v = g_dview[b->comp][b->vt];
             out[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, SR_LAYOUT};
         } else {
@@ -2178,9 +2198,10 @@ static uint32_t ubo_handle(int st, int reg, uint32_t off) {
     return h;
 }
 static void draw_texu(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {   // b->n entries: element k from the handle at off + 8k
+    g_tl_from = "draw_texu";
     for (int k = 0; k < b->n; k++) {
         uint32_t h = ubo_handle(st, b->reg, b->off + 8u * (uint32_t)k); int tid = h & 0xfffff ? (int)(h & 0xfffff) + S.tex_base : 0, sid = h >> 20 ? (int)(h >> 20) + S.samp_base : 0, why = 0;
-        VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why) : VK_NULL_HANDLE; VkSampler sm = sid ? samp_lookup(sid) : VK_NULL_HANDLE;
+        VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE; VkSampler sm = sid ? samp_lookup(sid) : VK_NULL_HANDLE;
         out[k] = (VkDescriptorImageInfo){sm ? sm : g_dsamp, v ? v : g_dview[b->comp][b->vt], SR_LAYOUT};
     }
 }
@@ -2219,11 +2240,12 @@ static void draw_tex_prep(void) {   // a draw with a program: everything said to
     }
 }
 static VkImageView draw_view(int st, const vkn_shader *sh, const vkn_sbind *b) {
+    g_tl_from = "draw_view";
     int s = b->reg; uint64_t bit = 1ull << (s & 63); uint8_t want = (uint8_t)(1 + b->vt + 3 * b->comp);
     if (!(T.td[st][s >> 6] & bit) && T.tvt[st][s] == want) return T.tv[st][s];
     T.td[st][s >> 6] &= ~bit; T.tvt[st][s] = want;
     int tid = (int)(T.tex[st][s] & 0xfffff), why = 0;
-    VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why) : VK_NULL_HANDLE;
+    VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
     if (why == TL_FEED) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d), a target of the pass it draws in: the slot reads zeros (a copy is a later slice)", sh->key, tid, st, s);
     else if (why == TL_COMP) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d) as %s, its format is not: the slot reads zeros", sh->key, tid, st, s, b->comp == 1 ? "unsigned integers" : b->comp == 2 ? "signed integers" : "floats");
     else if (why == TL_CUBE) { static int n; if (n++ < 8) NLOG("shader %s samples stage %d slot %d as a cube, and texture ID %d is not one this slice has (cube textures are a later slice): the slot reads zeros", sh->key, st, s, tid); }
@@ -2713,9 +2735,9 @@ void mtl_finish(void) { uint64_t f = atomic_load(&g_fence); while (!mtl_wait(f, 
 static void surf_report(const char *why);
 static void vkn_report(const char *why) {   // the backend's own line beside the surface one: what reached the GPU
     pthread_mutex_lock(&vkn_tmu); uint64_t ni = g_nimg, ib = g_img_b, gp = g_ghost_puts; pthread_mutex_unlock(&vkn_tmu);
-    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu, clears in a pass %llu, oversize clears in a pass of their own %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers; host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
+    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu, clears in a pass %llu, oversize clears in a pass of their own %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
          (unsigned long long)atomic_load(&g_present_n), why, (unsigned long long)atomic_load(&g_fence), (unsigned long long)g_stat_pass, (unsigned long long)g_stat_fold, (unsigned long long)g_stat_clr_mid,
-         (unsigned long long)g_stat_own, (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
+         (unsigned long long)g_stat_own, (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)g_stat_sr_more, (unsigned long long)g_stat_sr_split, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
 }
 #define STATS_FROM 60   // no statistics line before this present: the parity cut ends at the host's own line of present 1 or 2 (parity.py PRESENT), and lines before it must be the HLE's alone
 // The suspend path's bound (mtl_drain): Android calls it on the UI thread (front_android.c on_stop → dm_gfx_suspend), where a GPU that hangs must not hang the app into an ANR, the same 4 s as
