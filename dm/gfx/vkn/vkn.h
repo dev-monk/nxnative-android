@@ -31,7 +31,7 @@ typedef VkResult (VKAPI_PTR *vkn_create_surface_fn)(VkInstance, const void *, co
 #define VKN_DEVICE(X) X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) X(vkQueueWaitIdle) X(vkQueueSubmit2) X(vkQueuePresentKHR) X(vkCreateSwapchainKHR) \
     X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkWaitSemaphores) X(vkGetSemaphoreCounterValue) \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdPipelineBarrier2) \
-    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdClearAttachments) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdDraw) \
+    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdClearAttachments) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDraw) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkCreateSampler) X(vkDestroySampler) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
@@ -141,6 +141,7 @@ typedef struct vkn_shader {
     uint32_t io_mask; uint8_t io_ct[32], io_n[32];    // the interface between the stages, by location: a vertex shader's outputs, a pixel shader's inputs (component type as comp, components)
     uint8_t io_first[32], io_nd[32], io_dims[32][4];  // and the variable on each: its first location and array lengths (outermost first; io_nd 0: no array, io_first the location)
     int dyn;                                          // has TEXD / SAMPD bindings: c2 holds slot indices for it (draw_drv2)
+    int idmap;                                        // TEXD / SAMPD indices looked up in the slots' handles (vk_shader.c spv_idmap): the 32-word push constant table (nvn_vk.c draw_idmap)
     int dual;                                         // a pixel shader with an Output decorated Index other than 0 (dual-source blending's second colour)
     VkBuffer c1_buf; VkDeviceMemory c1_mem; uint32_t c1_n;
     VkDescriptorSetLayout cdsl; VkPipelineLayout cpl; VkPipeline cpso; int cbad;   // a compute shader's own layout and pipeline (nvn_vk.c op_dispatch); cbad: they cannot be made

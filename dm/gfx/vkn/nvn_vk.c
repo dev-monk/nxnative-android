@@ -1867,7 +1867,8 @@ static const lay_ent *lay_get(const vkn_shader *vs, const vkn_shader *ps) {
             lay_ent *m = calloc(1, sizeof *m); if (!m) die("vkn backend: layout entry allocation failed");
             VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, vkd_layout_flags(), n, b};
             VkResult r = vk.vkCreateDescriptorSetLayout(vd.dev, &di, NULL, &m->dsl);
-            VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &m->dsl, 0, NULL};
+            VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};   // the pixel shader's slot handles (draw_idmap)
+            VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &m->dsl, ps && ps->idmap ? 1 : 0, &pr};
             if (!r && (r = vk.vkCreatePipelineLayout(vd.dev, &pi, NULL, &m->pl))) vk.vkDestroyDescriptorSetLayout(vd.dev, m->dsl, NULL);
             if (r) { NLOG("[RED] the layout of shaders %s and %s cannot be made (VkResult %d): their draws are skipped", vs->key, ps ? ps->key : "-", r); free(m); }
             else { m->n = (int)n; e = m; DS(g_lay_made, 1); }
@@ -2220,6 +2221,17 @@ static void draw_dyn(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {
         }
     }
 }
+// The 32-word push constant table of a shader whose array indices look up handles read from memory (vk_shader.c spv_idmap): word k is what element k of its TEXD / SAMPD arrays
+// holds (draw_dyn), slot k's texture ID | its sampler ID << 20
+static void draw_idmap(VkCommandBuffer cb, VkPipelineLayout pl, VkShaderStageFlags sf, int st) {
+    uint32_t t[32];
+    for (int k = 0; k < 32; k++) {
+        uint64_t h = T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k];
+        uint32_t sid = (uint32_t)(T.samp[st][k] >> 20); if (!sid) sid = (uint32_t)(T.tex[st][k] >> 20);
+        t[k] = (uint32_t)(h & 0xfffff) | sid << 20;
+    }
+    vk.vkCmdPushConstants(cb, pl, sf, 0, sizeof t, t);
+}
 // A handle read from the stage's uniform slot reg at byte off (TEXU, nvn_mtl.m ubo_handle / ubo_tex_id / ubo_samp_id): the texture ID in its low 20 bits, the sampler ID above,
 // each in the pools bound now. Read from guest memory (an inline update of the buffer within this submission is not seen). Paper Mario: The Thousand-Year Door's deferred
 // lighting reads its lights' shadow and pattern textures this way (uniform slot 11): refused, Rogueport's lit pass was skipped and the town stayed dark
@@ -2314,7 +2326,8 @@ static int cs_make(vkn_shader *sh) {
     VkDescriptorSetLayoutBinding b[VKN_MAXB];
     for (int i = 0; i < sh->nb; i++) b[i] = (VkDescriptorSetLayoutBinding){sh->b[i].binding, bind_type(&sh->b[i]), bind_count(&sh->b[i]), VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, vkd_layout_flags(), (uint32_t)sh->nb, b};
-    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &sh->cdsl, 0, NULL};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
+    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &sh->cdsl, sh->idmap ? 1 : 0, &pr};
     VkResult r = vk.vkCreateDescriptorSetLayout(vd.dev, &di, NULL, &sh->cdsl);
     if (!r) r = vk.vkCreatePipelineLayout(vd.dev, &pi, NULL, &sh->cpl);
     if (!r) {
@@ -2402,6 +2415,7 @@ static void op_dispatch(const p_dispatch *d) {
     mem_barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
     vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, sh->cpso);
     if (sh->nb && !vkd_write_bp(cb, VK_PIPELINE_BIND_POINT_COMPUTE, sh->cpl, sh->cdsl, (uint32_t)sh->nb, wr)) { DS(g_disp_skip, 1); return; }
+    if (sh->idmap) draw_idmap(cb, sh->cpl, VK_SHADER_STAGE_COMPUTE_BIT, 5);
     vk.vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     mem_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
     static int nlog; if (nlog++ < 6) NLOG("dispatch %dx%dx%d: compute shader %s, %d storage images: run", d->x, d->y, d->z, sh->key, ni);
@@ -2619,6 +2633,7 @@ static int op_draw(const op_hdr *h, const uint8_t *a) {
     VkCommandBuffer cb = cb_now();
     if (!D.valid || D.pso != p) { vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); D.pso = p; }
     if (nw && vkd_write(cb, L->pl, L->dsl, nw, wr)) { DS(g_push, 1); DS(g_dwr, nw); }   // pushed, or a pool's set bound (vk_desc.c)
+    if (ps && ps->idmap) draw_idmap(cb, L->pl, VK_SHADER_STAGE_FRAGMENT_BIT, 1);
     if (!D.valid || memcmp(&D.vp, &vp, sizeof vp)) { vk.vkCmdSetViewport(cb, 0, 1, &vp); D.vp = vp; }
     if (!D.valid || memcmp(&D.sc, &sc, sizeof sc)) { vk.vkCmdSetScissor(cb, 0, 1, &sc); D.sc = sc; }
     if (!D.valid || memcmp(D.bc, S.blend_color, sizeof D.bc)) { vk.vkCmdSetBlendConstants(cb, S.blend_color); memcpy(D.bc, S.blend_color, sizeof D.bc); }

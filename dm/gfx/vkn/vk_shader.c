@@ -10,6 +10,7 @@
 #include "../nvn/nvn_hmap.h"
 #include "../../host/dm.h"
 #include "../../host/plat/sha256.h"   // the vendored portable SHA-256 (header only; plat.h's stand-in for CommonCrypto on Linux): the module's spv_sha256
+#include <dirent.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -360,6 +361,122 @@ static int c1_make(vkn_shader *sh, const char *hex, char *why, size_t wn) {
     sh->c1_n = (uint32_t)bi.size;
     return 1;
 }
+// A tex_dyn_slots array indexed by a handle the shader read from memory (Paper Mario: The Thousand-Year Door's material table, storage buffer s0, names the S block's reflection
+// cube by its own handle, texture ID 393): the translation's index is min(id, 31), so any ID past 31 read element 31. Each such clamp (UMin(x, 31) stored to a local, loaded,
+// bitcast, then the array's access chain index) becomes: x below 32 as before (c2's slot indices, draw_drv2), else the slot k whose bound handle has that ID (texture part
+// for a texture array, sampler part for a sampler array), from a 32-word push constant table (nvn_vk.c draw_idmap: slot k's handle, as element k holds it), else 31.
+// Returns the new module (malloc) and its size, or NULL: nothing to change. DM_VK_IDMAP=0: not done
+static int g_ida[4];   // modules rewritten, texture clamps, sampler clamps, clamps left as selects (a loop header or continue target)
+static uint32_t *spv_idmap(const uint32_t *w, size_t nw, const vkn_shader *sh, size_t *onw, int *nfix) {
+    enum { MAXA = 16, MAXF = 64 };
+    uint32_t bound = w[3], glsl = 0, tu = 0, tb = 0, arr[MAXA], c31[8]; int ak[MAXA], na = 0, nc = 0;
+    size_t first_type = 0, first_fn = 0;
+    for (size_t i = 5; i < nw; ) {   // globals: GLSL.std.450, uint and bool, uint 31, the TEXD / SAMPD arrays by their (patched) bindings
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 11 && wc >= 3 && !strcmp((const char *)(const void *)&w[i + 2], "GLSL.std.450")) glsl = w[i + 1];
+        if (op == 21 && wc == 4 && w[i + 2] == 32 && !w[i + 3]) tu = w[i + 1];
+        if (op == 20 && wc == 2) tb = w[i + 1];
+        if (op == 43 && wc == 4 && w[i + 1] == tu && tu && w[i + 3] == 31 && nc < 8) c31[nc++] = w[i + 2];
+        if (op == 71 && wc >= 4 && w[i + 2] == 33 && na < MAXA)
+            for (int b = 0; b < sh->nb; b++) if (sh->b[b].binding == w[i + 3] && (sh->b[b].kind == VKN_B_TEXD || sh->b[b].kind == VKN_B_SAMPD)) { arr[na] = w[i + 1]; ak[na++] = sh->b[b].kind == VKN_B_TEXD; }
+        if (!first_type && ((op >= 19 && op <= 39) || op == 43)) first_type = i;
+        if (op == 54) { first_fn = i; break; }
+        i += wc;
+    }
+    if (!glsl || !tu || !nc || !na || !first_type || !first_fn) return NULL;
+    // The clamps: access chain on an array → its index's bitcast source → the local it is loaded from → the UMin(x, 31) stored there
+    size_t fix[MAXF]; int fk[MAXF], nf = 0;
+    for (size_t i = first_fn; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        int a = -1; if (op == 65 && wc >= 5) for (int k = 0; k < na; k++) if (w[i + 3] == arr[k]) a = k;
+        if (a >= 0) {
+            uint32_t ix = w[i + 4], var = 0;
+            for (size_t j = first_fn; j < i; ) { uint32_t o2 = w[j] & 0xffff, c2 = w[j] >> 16; if (o2 == 124 && c2 == 4 && w[j + 2] == ix) ix = w[j + 3]; j += c2; }   // OpBitcast
+            for (size_t j = first_fn; j < i; ) { uint32_t o2 = w[j] & 0xffff, c2 = w[j] >> 16; if (o2 == 61 && c2 >= 4 && w[j + 2] == ix) var = w[j + 3]; j += c2; }   // OpLoad
+            for (size_t j = first_fn; j < i; ) {
+                uint32_t o2 = w[j] & 0xffff, c2 = w[j] >> 16;
+                uint32_t val = o2 == 62 && c2 >= 3 && w[j + 1] == var ? w[j + 2] : o2 == 12 && c2 == 7 && w[j + 2] == ix ? ix : 0;   // OpStore into the local, or the index itself
+                if (val) for (size_t m = first_fn; m < i; ) { uint32_t o3 = w[m] & 0xffff, c3 = w[m] >> 16;
+                    if (o3 == 12 && c3 == 7 && w[m + 2] == val && w[m + 3] == glsl && w[m + 4] == 38) {   // OpExtInst UMin
+                        int is31 = 0; for (int q = 0; q < nc; q++) is31 |= w[m + 6] == c31[q];
+                        int dup = 0; for (int q = 0; q < nf; q++) dup |= fix[q] == m;
+                        if (is31 && !dup && nf < MAXF) { fix[nf] = m; fk[nf++] = ak[a]; } }
+                    m += c3; }
+                j += c2;
+            }
+        }
+        i += wc;
+    }
+    if (!nf) return NULL;
+    // A clamp's block becomes a selection: the search runs only for x of 32 or more (most pixels take c2's slot indices). Not where the block holds an OpLoopMerge or is a
+    // loop's continue target (the header must stay one block): there the search is unconditional selects
+    uint32_t blab[MAXF]; int nobr[MAXF];
+    for (int q = 0; q < nf; q++) {
+        uint32_t lab = 0; size_t e = nw;
+        for (size_t i = first_fn; i < fix[q]; ) { if ((w[i] & 0xffff) == 248) lab = w[i + 1]; i += w[i] >> 16; }
+        nobr[q] = !lab;
+        for (size_t i = fix[q]; i < nw && e == nw; ) { uint32_t o2 = w[i] & 0xffff; if (o2 == 248 || o2 == 56) e = i; else if (o2 == 246) nobr[q] = 1; i += w[i] >> 16; }
+        for (size_t i = first_fn; i < nw; ) { if ((w[i] & 0xffff) == 246 && (w[i] >> 16) >= 4 && w[i + 2] == lab) nobr[q] = 1; i += w[i] >> 16; }
+        blab[q] = lab;
+    }
+    uint32_t rmap[MAXF][2]; int nr = 0; size_t myphi[MAXF]; int nmp = 0;
+    // New ids: uint constants 0-31, 32, 0xfffff, 20; bool if absent; the push constant block uint[32] and its pointers
+    uint32_t ck[32], c32, cmask, c20, tbool = tb ? tb : bound++, tarr, tst, tpst, tpu, vpc;
+    for (int k = 0; k < 32; k++) ck[k] = bound++;
+    c32 = bound++; cmask = bound++; c20 = bound++; tarr = bound++; tst = bound++; tpst = bound++; tpu = bound++; vpc = bound++;
+    size_t per = 7 + 32 * 26 + 5 + 6 + 3 + 4 + 2 + 2 + 2 + 7, cap = nw + 16 + 4 * 36 + 3 + 4 + 3 + 4 + 4 + 4 + (size_t)nf * per;
+    uint32_t *o = malloc(cap * 4); if (!o) return NULL;
+    size_t n = 0;
+#define EMIT(...) do { uint32_t _t[] = {__VA_ARGS__}; memcpy(o + n, _t, sizeof _t); n += sizeof _t / 4; } while (0)
+    for (size_t i = 0; i < nw; ) {
+        uint32_t wc = i < 5 ? 5 : w[i] >> 16;
+        if (i == first_type) {   // the decorations end here: the block's
+            EMIT(4u << 16 | 71, tarr, 6, 4); EMIT(3u << 16 | 71, tst, 2); EMIT(5u << 16 | 72, tst, 0, 35, 0);   // ArrayStride 4, Block, member 0 Offset 0
+        }
+        if (i == first_fn) {     // the types and constants end here
+            if (!tb) EMIT(2u << 16 | 20, tbool);
+            for (int k = 0; k < 32; k++) EMIT(4u << 16 | 43, tu, ck[k], (uint32_t)k);
+            EMIT(4u << 16 | 43, tu, c32, 32); EMIT(4u << 16 | 43, tu, cmask, 0xfffff); EMIT(4u << 16 | 43, tu, c20, 20);
+            EMIT(4u << 16 | 28, tarr, tu, c32); EMIT(3u << 16 | 30, tst, tarr);
+            EMIT(4u << 16 | 32, tpst, 9, tst); EMIT(4u << 16 | 32, tpu, 9, tu); EMIT(4u << 16 | 59, tpst, vpc, 9);
+        }
+        int f = -1; for (int q = 0; q < nf; q++) if (fix[q] == i) f = q;
+        if (i == 0) { memcpy(o, w, 20); n = 5; }
+        else if (f < 0) { memcpy(o + n, w + i, wc * 4); n += wc; }
+        else {   // R = x < 32 ? x : the slot whose handle part is x (the lowest), else UMin(x, 31)
+            uint32_t res = w[i + 2], x = w[i + 5], prev = bound++, sl = 0, ml = 0;
+            EMIT(7u << 16 | 12, tu, prev, glsl, 38, x, w[i + 6]);
+            if (!nobr[f]) {   // header: x < 32 goes straight to the merge block
+                uint32_t lt = bound++; sl = bound++; ml = bound++;
+                EMIT(5u << 16 | 176, tbool, lt, x, c32); EMIT(3u << 16 | 247, ml, 0); EMIT(4u << 16 | 250, lt, ml, sl); EMIT(2u << 16 | 248, sl);
+            }
+            for (int k = 31; k >= 0; k--) {
+                uint32_t p = bound++, e = bound++, pt = bound++, q = bound++, s = bound++;
+                EMIT(6u << 16 | 65, tpu, p, vpc, ck[0], ck[k]); EMIT(4u << 16 | 61, tu, e, p);
+                if (fk[f]) EMIT(5u << 16 | 199, tu, pt, e, cmask); else EMIT(5u << 16 | 194, tu, pt, e, c20);
+                EMIT(5u << 16 | 170, tbool, q, pt, x); EMIT(6u << 16 | 169, tu, s, q, ck[k], prev); prev = s;
+            }
+            if (!nobr[f]) {   // the merge block takes the rest of the original block: its phis' edges from that block now come from here
+                uint32_t hl = blab[f]; for (int r = 0; r < nr; r++) if (rmap[r][0] == blab[f]) hl = rmap[r][1];
+                EMIT(2u << 16 | 249, ml); EMIT(2u << 16 | 248, ml); myphi[nmp++] = n; EMIT(7u << 16 | 245, tu, res, x, hl, prev, sl);
+                int r = 0; while (r < nr && rmap[r][0] != blab[f]) r++;
+                if (r == nr && nr < MAXF) { rmap[r][0] = blab[f]; nr++; }
+                if (r < MAXF) rmap[r][1] = ml;
+            } else { uint32_t lt = bound++; EMIT(5u << 16 | 176, tbool, lt, x, c32); EMIT(6u << 16 | 169, tu, res, lt, x, prev); }
+        }
+        i += wc;
+    }
+#undef EMIT
+    for (size_t i = 5; i < n && nr; ) {   // the original phis: an edge from a split block comes from its last merge block
+        uint32_t op = o[i] & 0xffff, wc = o[i] >> 16;
+        int mine = 0; for (int q = 0; q < nmp; q++) mine |= myphi[q] == i;
+        if (op == 245 && !mine) for (uint32_t a = 4; a + 1 <= wc - 1; a += 2) for (int r = 0; r < nr; r++) if (o[i + a] == rmap[r][0]) { o[i + a] = rmap[r][1]; break; }
+        i += wc;
+    }
+    g_ida[0]++; for (int q = 0; q < nf; q++) { g_ida[fk[q] ? 1 : 2]++; g_ida[3] += nobr[q]; }
+    o[3] = bound; *onw = n; *nfix = nf;
+    return o;
+}
 static uint32_t g_shid;
 // The SPIR-V's SHA-256 against the reflection's spv_sha256: its first 8 bytes, 16 lowercase hex digits (dmsh_build_vk.py: of the decompressed module)
 static int sha_ok(const void *spv, size_t n, const char *want) {
@@ -388,9 +505,15 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
     else if (refl_take(sh, &j, why, sizeof why) && spv_patch(spv, nbytes / 4, sh, why, sizeof why)) {
         for (int b = 0; b < sh->nb && !*why; b++) if (sh->b[b].kind == VKN_B_C1 && !sh->c1_buf) c1_make(sh, j_s(&j, "c1"), why, sizeof why);
         if (!*why) {
-            VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nbytes, spv};
+            static int idm = -1; if (idm < 0) { const char *x = getenv("DM_VK_IDMAP"); idm = !(x && *x == '0'); }
+            size_t mn = nbytes / 4; uint32_t *ms = spv; int nfix = 0;
+            if (idm && sh->dyn && (stage == 1 || stage == 5)) { uint32_t *p = spv_idmap(spv, nbytes / 4, sh, &mn, &nfix); if (p) { ms = p; sh->idmap = nfix; } else mn = nbytes / 4; }
+            { const char *dd = getenv("DM_VK_IDMAP_DUMP"); if (dd && *dd && ms != spv) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_IDMAP_DUMP=<dir>: the rewritten modules, for spirv-val
+            VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, mn * 4, ms};
             VkResult r = vk.vkCreateShaderModule(vd.dev, &ci, NULL, &sh->mod);
             if (r) snprintf(why, sizeof why, "vkCreateShaderModule: %d", r);
+            if (sh->idmap) { static int nl; if (nl++ < 4) VLOG("shader %s: %d array index clamps look up the bound slots' handles (a handle read from memory; first cases)", hk, nfix); }
+            if (ms != spv) free(ms);
         }
     }
     j_free(&j);
@@ -398,8 +521,9 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
     sh->id = ++g_shid; atomic_fetch_add_explicit(&g_nload, 1, memory_order_relaxed);
     return sh;
 }
+static void idmap_all(void);
 vkn_shader *vkn_shader_get(const uint8_t key[8], int stage) {
-    shaders_init();
+    shaders_init(); idmap_all();
     void *v = nvn_hm_get(&g_mods, key);
     if (v) return v == REFUSED ? NULL : v;
     vkn_shader *sh = NULL;
@@ -416,6 +540,23 @@ vkn_shader *vkn_shader_get(const uint8_t key[8], int stage) {
     }
     nvn_hm_put(&g_mods, key, sh ? (void *)sh : REFUSED);
     return sh;
+}
+// DM_VK_IDMAP_ALL=1 (diagnostics): at the first shader load, every pixel and compute shader of the folder with a tex_dyn_slots array is loaded too, so spv_idmap rewrites all of them
+// (with DM_VK_IDMAP_DUMP, all are written for spirv-val), and the totals are said
+static void idmap_all(void) {
+    static int done; const char *e = getenv("DM_VK_IDMAP_ALL");
+    if (done || !e || *e != '1' || !g_dir_ok) return;
+    done = 1; DIR *d = opendir(g_dir); struct dirent *de; int n = 0;
+    while (d && (de = readdir(d))) {
+        size_t l = strlen(de->d_name); if (l != 23 || strcmp(de->d_name + 16, "_b.json")) continue;
+        char p[1024]; snprintf(p, sizeof p, "%s/%s", g_dir, de->d_name); char *j = slurp(p, NULL);
+        int st = j && strstr(j, "_cb0_40000000") ? (strstr(j, "\"stage\": \"ps\"") ? 1 : strstr(j, "\"stage\": \"cs\"") ? 5 : -1) : -1; free(j);
+        if (st < 0) continue;
+        uint8_t k[8]; for (int i = 0; i < 8; i++) { unsigned v; sscanf(de->d_name + 2 * i, "%2x", &v); k[i] = (uint8_t)v; }
+        vkn_shader_get(k, st); n++;
+    }
+    if (d) closedir(d);
+    VLOG("DM_VK_IDMAP_ALL: %d shaders with tex_dyn_slots arrays loaded: %d rewritten, %d texture and %d sampler clamps, %d of them as selects", n, g_ida[0], g_ida[1], g_ida[2], g_ida[3]);
 }
 // The tests' modules (t_vkn.c): a map entry and a module from memory, as if read from the directory
 vkn_shader *vkn_shader_add(const uint8_t key[8], int stage, const char *json, const uint32_t *spv, size_t nbytes) {
