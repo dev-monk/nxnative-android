@@ -1462,10 +1462,13 @@ static VkSampler samp_make(const samp_par *p, int integer) {   // integer: an in
     ci.addressModeU = w[0]; ci.addressModeV = w[1]; ci.addressModeW = w[2];
     float lo = p->lod_min > 0 ? p->lod_min : 0, hi = p->lod_max >= lo ? p->lod_max : lo;   // NaN: 0 and lo
     if (p->minf <= 1) { lo = 0; hi = 0.25f; }
+    { static int tl = -1; if (tl < 0) { const char *x = getenv("DM_VK_DIAG"); tl = x && strstr(x, "texlod"); }   // DM_VK_DIAG=texlod (wrong on purpose, a bound on texture bandwidth): mips from level 4
+      if (tl && hi > 4) lo = 4; }
     ci.minLod = lo; ci.maxLod = hi;
     ci.mipLodBias = samp_bias(p->lod_bias);
-    if (p->aniso > 1) {
-        float ma = vd.props.limits.maxSamplerAnisotropy > 16 ? 16 : vd.props.limits.maxSamplerAnisotropy;
+    static float cap = -1; if (cap < 0) { const char *x = getenv("DM_VK_ANISO"); cap = x && *x ? (float)atof(x) : 16; }   // DM_VK_ANISO=<n>: anisotropy at most n (1: none)
+    if (p->aniso > 1 && cap > 1) {
+        float ma = vd.props.limits.maxSamplerAnisotropy > cap ? cap : vd.props.limits.maxSamplerAnisotropy;
         if (vd.aniso && ma > 1) { ci.anisotropyEnable = VK_TRUE; ci.maxAnisotropy = p->aniso < ma ? p->aniso : ma; }
         else NRED_ONCE("an anisotropic sampler (%g), and the device has no anisotropic filtering: filtered without", p->aniso);
     }
@@ -1902,6 +1905,36 @@ static VkImage g_dimg[6]; static VkDeviceMemory g_dmem[6], g_zmem; static VkImag
 // render_scale float[73] at 192 with stride 16): render scale 1.0, the rest 0, as nvn_mtl.m support_buf. Paper Mario: The Thousand-Year Door: 6,100 of its modules bind it
 static VkBuffer g_supbuf; static VkDeviceMemory g_supmem;
 static VkPipelineCache g_pcache;
+// The pipeline cache on disk: <DM_VK_SHADERS>/pipelines.vkpc, read when the cache is made, written (whole, through a temporary file) every 300 frames when pipelines were made since
+// and at mtl_drain. Without it every launch compiles every pipeline again: TTYD's title makes ~150 (4.1 s, up to 264 ms each on the RG 476H). The driver checks the header and
+// ignores data from another device or driver. DM_VK_PCACHE=0: in memory only
+static uint64_t g_pc_saved;   // g_pso_made at the last write
+static const char *pc_path(void) {
+    static char p[1024]; static int done;
+    if (!done) { done = 1; const char *x = getenv("DM_VK_PCACHE"), *d = getenv("DM_VK_SHADERS"); if (!(x && *x == '0') && d && *d) snprintf(p, sizeof p, "%s/pipelines.vkpc", d); }
+    return p[0] ? p : NULL;
+}
+static void *pc_read(size_t *n) {
+    const char *p = pc_path(); *n = 0; if (!p) return NULL;
+    FILE *f = fopen(p, "rb"); if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    void *b = sz > 0 ? malloc((size_t)sz) : NULL;
+    if (b && fread(b, 1, (size_t)sz, f) == (size_t)sz) *n = (size_t)sz; else { free(b); b = NULL; }
+    fclose(f); return b;
+}
+static void pc_save(void) {
+    const char *p = pc_path(); if (!p || !g_pcache) return;
+    uint64_t made = atomic_load(&g_pso_made); if (made == g_pc_saved) return;
+    size_t n = 0; if (vk.vkGetPipelineCacheData(vd.dev, g_pcache, &n, NULL) || !n) return;
+    void *b = malloc(n); if (!b) return;
+    if (vk.vkGetPipelineCacheData(vd.dev, g_pcache, &n, b) == VK_SUCCESS) {
+        char t[1040]; snprintf(t, sizeof t, "%s.tmp", p);
+        FILE *f = fopen(t, "wb"); int ok = f && fwrite(b, 1, n, f) == n; if (f) ok = !fclose(f) && ok;
+        if (ok && !rename(t, p)) { g_pc_saved = made; NLOG("pipeline cache written: %zu KiB, %llu pipelines made this run", n >> 10, (unsigned long long)made); }
+        else NRED_ONCE("the pipeline cache cannot be written to %s: pipelines are compiled again at the next launch", p);
+    }
+    free(b);
+}
 static int buf_host(VkDeviceSize n, VkBufferUsageFlags u, VkBuffer *b, VkDeviceMemory *m, void **map) {   // a host-visible coherent buffer, mapped
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL}; VkMemoryRequirements mr; int mt;
     *b = VK_NULL_HANDLE; *m = VK_NULL_HANDLE;
@@ -1944,7 +1977,11 @@ static void draw_init(void) {   // vkn_hello, before any submission: the dummies
     VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO}; si.maxLod = 0.25f;
     if (vk.vkCreateSampler(vd.dev, &si, NULL, &g_dsamp)) { NLOG("[RED] the draws' dummy sampler cannot be made: nothing is drawn"); return; }
     VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    if (vk.vkCreatePipelineCache(vd.dev, &pci, NULL, &g_pcache)) g_pcache = VK_NULL_HANDLE;   // none: pipelines are made without one
+    size_t pcn; void *pcd = pc_read(&pcn); pci.initialDataSize = pcn; pci.pInitialData = pcd;
+    if (vk.vkCreatePipelineCache(vd.dev, &pci, NULL, &g_pcache)) {   // data the driver refuses: an empty cache
+        pci.initialDataSize = 0; pci.pInitialData = NULL; if (vk.vkCreatePipelineCache(vd.dev, &pci, NULL, &g_pcache)) g_pcache = VK_NULL_HANDLE;   // none: pipelines are made without one
+    } else if (pcn) NLOG("pipeline cache read: %zu KiB from %s", pcn >> 10, pc_path());
+    free(pcd);
     VkCommandPool pool; VkCommandBuffer cb;
     VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, vd.qfam};
     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
@@ -3029,6 +3066,7 @@ void mtl_drain(void) {   // the last lines of a run (the graceful exit ends in _
         ok = ok && used < DRAIN_NS && mtl_wait(atomic_load(&g_fence), DRAIN_NS - used);
         if (!ok) NLOG("[RED] graphics suspend: the GPU work in flight has not finished in %llu s: suspended regardless (it completes behind it)", (unsigned long long)(DRAIN_NS / 1000000000ull));
     }
+    if (g_vk) pc_save();
     if (atomic_load(&g_present_n) >= STATS_FROM) { if (g_vk) { vkn_report("graphics suspended: exit, or the app in the background"); draw_report("graphics suspended: exit, or the app in the background"); b_report("graphics suspended: exit, or the app in the background"); t_report("graphics suspended: exit, or the app in the background"); }
         surf_report("graphics suspended: exit, or the app in the background"); }
 }
@@ -3118,6 +3156,7 @@ static uint64_t present_count(void) {
     uint64_t n = atomic_fetch_add(&g_present_n, 1) + 1;
     // Not worded "first present": lognorm.py --until-present ends the parity cut at that phrase, and this line comes before the host's own (DM_DETCLOCK, [nvn] frame 1) that end it on the Metal backend
     if (n == 1) { NLOG("%s", g_vk ? "presenting: frames go to the swapchain" : "presenting: frames are counted, nothing is shown"); if (g_nshot && !g_vk) NLOG("[RED] DM_NVN_SHOT: no Vulkan device, no screenshots"); }
+    if (g_vk && n % 300 == 0) pc_save();
     if (n >= STATS_FROM && (n == 60 || n == 600 || n % 1800 == 0 || (g_every && n % g_every == 0))) { surf_report("periodic"); if (g_vk) { vkn_report("periodic"); draw_report("periodic"); b_report("periodic"); t_report("periodic"); } }   // the count before this present: labelled with the frame just ended
     return n;
 }

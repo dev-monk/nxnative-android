@@ -38,7 +38,7 @@ typedef VkResult (VKAPI_PTR *vkn_create_surface_fn)(VkInstance, const void *, co
     X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkDestroyPipeline) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
     X(vkInvalidateMappedMemoryRanges) X(vkFlushMappedMemoryRanges) X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkGetBufferDeviceAddress) X(vkCmdCopyBufferToImage) \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdSetBlendConstants) \
-    X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdPushDescriptorSetKHR) X(vkCreatePipelineCache) \
+    X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdPushDescriptorSetKHR) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
     X(vkDestroyPipelineCache)
 typedef struct {
 #define VKN_PFN(n) PFN_##n n;
