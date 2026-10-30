@@ -1996,7 +1996,8 @@ static VkShaderModule solid_ps(void) {
 static VkPipeline pso_make(const pso_key *k, const vkn_shader *vs, const vkn_shader *ps, VkPipelineLayout pl) {
     VkPipelineShaderStageCreateInfo stg[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs->mod, "main", NULL},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps ? ps->mod : VK_NULL_HANDLE, "main", NULL}};
-    { const char *dg = getenv("DM_VK_DIAG"); if (dg && strstr(dg, "solidps") && ps && solid_ps()) stg[1].module = solid_ps(); }
+    { const char *dg = getenv("DM_VK_DIAG"), *sp = getenv("DM_VK_SOLID_PS");   // DM_VK_SOLID_PS=<pixel key>[,…]: only those shaders' draws (which draw writes a pixel)
+      if (((dg && strstr(dg, "solidps")) || (sp && ps && strstr(sp, ps->key))) && ps && solid_ps()) stg[1].module = solid_ps(); }
     VkVertexInputAttributeDescription ad[16]; VkVertexInputBindingDescription bd[16];
     for (int i = 0; i < k->nin; i++) ad[i] = (VkVertexInputAttributeDescription){k->in[i].loc, k->in[i].bind, (VkFormat)k->in[i].fmt, k->in[i].off};
     for (int i = 0; i < k->nbd; i++) bd[i] = (VkVertexInputBindingDescription){k->bd[i].idx, k->bd[i].stride, k->bd[i].rate ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
@@ -2472,7 +2473,25 @@ static void passlog(const op_hdr *h, const uint8_t *a, uint64_t skipped_before) 
                 n += e ? snprintf(b + n, sizeof b - n, "(f%#x %ux%u up%d L%d)", e->nvn_fmt, e->w, e->h, (int)e->up, (int)e->layout) : snprintf(b + n, sizeof b - n, "(no host image)");
                 pthread_mutex_unlock(&vkn_tmu); } }
         if (n < (int)sizeof b) n += snprintf(b + n, sizeof b - n, " vp %.0f,%.0f %.0fx%.0f sc %s%d,%d %dx%d dummies %llu", S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], R.has_sc ? "" : "none ",
-                                             R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long long)atomic_load(&g_ddum)); }
+                                             R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long long)atomic_load(&g_ddum));
+        // DM_VK_PASSLOG_PS=<pixel key>[,…]: every binding of those draws' pixel shader, as for a dispatch (texture slots with ID, serial, format and target; arrays element by element)
+        static const char *pps = (const char *)1; if (pps == (const char *)1) pps = getenv("DM_VK_PASSLOG_PS");
+        const vkn_shader *sh = pps && pp ? pp->sh[1] : NULL;
+        if (sh && strstr(pps, sh->key)) { NLOG("%s", b); n = 0;
+            for (int i = 0; i < sh->nb; i++) { const vkn_sbind *x = &sh->b[i]; char l[200];
+                int k0 = x->kind == VKN_B_TEXD ? 0 : x->reg, k1 = x->kind == VKN_B_TEXD ? (x->n < 64 ? x->n : 64) : x->reg + 1;
+                if (x->kind == VKN_B_TEX || x->kind == VKN_B_TEXD) for (int k = k0; k < k1; k++) { int tid = (int)(T.tex[1][k] & 0xfffff);
+                    pthread_mutex_lock(&g_rmu); uint64_t ser = tid && tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0; unsigned fm = ser ? g_treg[tid].t.d.format : 0, tg = ser ? g_treg[tid].t.d.target : 0, w = ser ? g_treg[tid].t.d.width : 0, ht = ser ? g_treg[tid].t.d.height : 0; pthread_mutex_unlock(&g_rmu);
+                    if (x->kind == VKN_B_TEXD && !tid) continue;
+                    snprintf(l, sizeof l, "passlog   ps %s binding %u slot %d vt %u comp %u: handle %#llx texture ID %d ser%llu %ux%u format %#x target %u", x->kind == VKN_B_TEXD ? "texd" : "tex", x->binding, k, x->vt, x->comp,
+                             (unsigned long long)T.tex[1][k], tid, (unsigned long long)ser, w, ht, fm, tg); NLOG("%s", l); }
+                else if (x->kind == VKN_B_UBO || x->kind == VKN_B_UBOP) { snprintf(l, sizeof l, "passlog   ps ubo binding %u slot %u: %#llx + %llu", x->binding, x->reg, (unsigned long long)S.ubo[1][x->reg].addr, (unsigned long long)S.ubo[1][x->reg].size); NLOG("%s", l); }
+                else if (x->kind == VKN_B_SBUF) { snprintf(l, sizeof l, "passlog   ps sbuf binding %u slot %u: %#llx + %llu", x->binding, x->reg, (unsigned long long)S.ssbo[1][x->reg].addr, (unsigned long long)S.ssbo[1][x->reg].size); NLOG("%s", l); }
+                else if (x->kind == VKN_B_TEXU) for (int k = 0; k < x->n && k < 8; k++) { uint32_t hu = ubo_handle(1, x->reg, x->off + 8u * (uint32_t)k); int tid = hu & 0xfffff ? (int)(hu & 0xfffff) + S.tex_base : 0;
+                    pthread_mutex_lock(&g_rmu); uint64_t ser = tid && tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0; unsigned fm = ser ? g_treg[tid].t.d.format : 0, w = ser ? g_treg[tid].t.d.width : 0, ht = ser ? g_treg[tid].t.d.height : 0; pthread_mutex_unlock(&g_rmu);
+                    snprintf(l, sizeof l, "passlog   ps texu binding %u uniform slot %u off %u: handle %#x texture ID %d ser%llu %ux%u format %#x", x->binding, x->reg, x->off + 8u * (uint32_t)k, hu, tid, (unsigned long long)ser, w, ht, fm); NLOG("%s", l); }
+                else { snprintf(l, sizeof l, "passlog   ps binding %u kind %u reg %u", x->binding, x->kind, x->reg); NLOG("%s", l); } }
+            return; } }
     else if (h->op == OP_DISPATCH) { const p_dispatch *d = (const p_dispatch *)a; const prog_ent *pc = S.bst[5] ? prog_ent_get(S.bst[5]) : NULL; const vkn_shader *sh = pc ? pc->sh[5] : NULL;
         n += snprintf(b + n, sizeof b - n, " %dx%dx%d%s cs %s (has %#x bad %#x)", d->x, d->y, d->z, d->ind ? " indirect" : "", sh ? sh->key : "-", pc ? pc->has : 0, pc ? pc->bad : 0);
         NLOG("%s", b); n = 0;
