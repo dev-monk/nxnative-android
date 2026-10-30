@@ -604,6 +604,7 @@ VkImageView vkn_img_view(vkn_img *e, uint32_t level, uint32_t layer, int present
 }
 static void img_free(vkn_img *e) {
     if (e->fbv) vk.vkDestroyImageView(vd.dev, e->fbv, NULL);
+    if (e->fbsv) vk.vkDestroyImageView(vd.dev, e->fbsv, NULL);
     if (e->fbi) { vk.vkDestroyImage(vd.dev, e->fbi, NULL); vk.vkFreeMemory(vd.dev, e->fbm, NULL); }
     for (int i = 0; i < e->nviews; i++) vk.vkDestroyImageView(vd.dev, e->views[i].v, NULL);
     for (int i = 0; i < e->nsviews; i++) vk.vkDestroyImageView(vd.dev, e->sviews[i].v, NULL);
@@ -829,12 +830,14 @@ static vkn_img *xfer_img(const tex_t *t, int dst) {   // under vkn_tmu: the host
     use_mark(e);
     return e;
 }
+static uint64_t g_fb_ep = 1;   // the write epoch of feedback copies (fb_copy): a dispatch or buffer-to-texture copy starts another
 static void op_copy_t2t(const p_copy_t2t *c) {
     if (!copy_on()) return;
     if (c->flags & DM_COPY_RESOLVE) { NRED_ONCE("a multisample resolve (Downsample): not done (multisampled host images are a later slice)"); return; }
     rp_flush();
     pthread_mutex_lock(&vkn_tmu);
     vkn_img *s = xfer_img(c->src, 0), *d = xfer_img(c->dst, 1);
+    if (d) d->fb_ok = 0;   // its feedback copy is no longer current (fb_copy)
     pthread_mutex_unlock(&vkn_tmu);
     if (!s || !d) { NRED_ONCE("COPY_T2T: the %s (ser=%llu) has no host image: the copy is skipped", !s ? "source" : "destination", (unsigned long long)(!s ? (c->src ? c->src->serial : 0) : (c->dst ? c->dst->serial : 0))); return; }
     if (!(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(d->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || s->aspect != d->aspect) {
@@ -868,6 +871,7 @@ static void op_clear_tex(const p_clear_tex *c) {
     if (!copy_on()) return;
     rp_flush();
     pthread_mutex_lock(&vkn_tmu); vkn_img *e = xfer_img(c->tex, 1); pthread_mutex_unlock(&vkn_tmu);
+    if (e) e->fb_ok = 0;
     if (!e) return;   // said by img_make
     if (e->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(e->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { NRED_ONCE("CLEAR_TEX: texture ser=%llu (format %d) is not a colour image this device can clear: skipped", (unsigned long long)e->serial, e->fmt); return; }
     uint32_t lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, ly = (c->has_view && c->view.set_layers ? c->view.min_layer : 0) + (uint32_t)(c->r.zoffset > 0 ? c->r.zoffset : 0);
@@ -913,6 +917,7 @@ static unsigned chan_mask(const vkn_img *e) {
 static void op_clear_color(const p_clear_color *c) {
     if (c->index < 0 || c->index >= R.n || !R.cser[c->index] || !(R.act >> c->index & 1)) { NRED_ONCE("colour clear of slot %d, which has no target: skipped", c->index); return; }
     vkn_img *e = R.ce[c->index]; if (!e) return;   // no host image: said at SET_RT
+    e->fb_ok = 0;
     unsigned all = chan_mask(e); if ((c->mask & all) != all) { NRED_ONCE("colour clear with channel mask %#x of a target with channels %#x: needs a draw (a later slice), skipped", c->mask, all); return; }
     VkExtent2D x = lv_ext(e, R.clv[c->index]);
     if (sc_full(x) && (!R.on || oversize_mid(x))) { R.clear_c[c->index] = 1; memcpy(R.cc[c->index].float32, c->rgba, sizeof c->rgba); return; }   // folded into the next pass's load op
@@ -923,6 +928,7 @@ static void op_clear_color(const p_clear_color *c) {
 }
 static void op_clear_ds(const p_clear_ds *c) {
     vkn_img *e = R.de; if (!R.dser || !e) return;   // no depth target: nothing to clear (none made: said at SET_RT)
+    e->fb_ok = 0;
     unsigned sm = (unsigned)c->stencil_mask & 0xff; int cd = c->depth_mask && (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT), cs = sm && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
     if (cs && sm != 0xff) { NRED_ONCE("depth-stencil clear with stencil mask %#x: needs a draw (a later slice), its stencil part is skipped", sm); cs = 0; }
     if (!cd && !cs) return;
@@ -1114,9 +1120,19 @@ static void tj_fallback(tjob *q) {
 static int tex_init_ok(const vkn_img *e, const tex_t *t);
 // A draw sampling a target of its own pass (on the Switch it reads what the pass drew so far: Paper Mario: The Thousand-Year Door's pass over its 1920x1080 composite samples it,
 // and read as zeros it wrote the frame black): the pass ends, level 0 / layer 0 is copied into the image's twin, and the draw samples the twin. DM_VK_FEEDBACK=0: zeros, as before
-static VkImageView fb_copy(vkn_img *e) {
-    static int on = -1; if (on < 0) { const char *v = getenv("DM_VK_FEEDBACK"); on = !(v && *v == '0'); }
-    if (!on || e->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(e->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || e->depth > 1) return VK_NULL_HANDLE;
+// A depth target sampled for its depth gets the same (stencil: none, zeros): Paper Mario: The Thousand-Year Door's decals (decal.bfsha, the characters' shadows) test against the
+// 960x540 depth-stencil and sample its depth in the same pass; read as zeros, no decal drew. The twin's view is of the depth aspect. DM_VK_FEEDBACK_DEPTH=0: zeros, as before
+// The reflection pass (reflection.bfsha) reads the stencil it tests against the same way: the twin's stencil view.
+// The copy is made again only once the part sampled may have changed: a draw that writes it (colour; depth, or stencil, writes for a depth target: draw_fb_mark), a clear or copy into the
+// image, a dispatch or buffer-to-texture copy (g_fb_ep), a new frame. The decals write stencil only, so they sample one depth copy and the pass stays open. DM_VK_FEEDBACK_REUSE=0: a copy at each lookup
+static uint64_t g_stat_fb[3];   // feedback copies made: colour, depth; copies reused
+static VkImageView fb_copy(vkn_img *e, int stencil) {
+    static int on = -1, don = -1, reuse = -1; if (on < 0) { const char *v = getenv("DM_VK_FEEDBACK"); on = !(v && *v == '0'); v = getenv("DM_VK_FEEDBACK_DEPTH"); don = !(v && *v == '0');
+                                                            v = getenv("DM_VK_FEEDBACK_REUSE"); reuse = !(v && *v == '0'); }
+    int ds = e->aspect != VK_IMAGE_ASPECT_COLOR_BIT;
+    if (!on || (ds && (!don || !(e->aspect & (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT)))) || !(e->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || e->depth > 1) return VK_NULL_HANDLE;
+    uint64_t ep = g_fb_ep ^ atomic_load(&g_present_n) << 32; uint8_t part = stencil && ds ? 2 : 1;
+    if (reuse && e->fbi && (e->fb_ok & part) && e->fb_ep == ep) { g_stat_fb[2]++; use_mark(e); return stencil && ds ? e->fbsv : e->fbv; }
     if (!e->fbi) {
         VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, e->fmt, {e->w, e->h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
@@ -1125,12 +1141,16 @@ static VkImageView fb_copy(vkn_img *e) {
         vk.vkGetImageMemoryRequirements(vd.dev, e->fbi, &mr);
         if ((mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) < 0) mt = vkn_mem_type(mr.memoryTypeBits, 0);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
-        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, e->fbi, VK_IMAGE_VIEW_TYPE_2D, e->fmt, {0}, {e->aspect, 0, 1, 0, 1}};
-        if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &e->fbm) || vk.vkBindImageMemory(vd.dev, e->fbi, e->fbm, 0) || vk.vkCreateImageView(vd.dev, &vi, NULL, &e->fbv)) {
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, e->fbi, VK_IMAGE_VIEW_TYPE_2D, e->fmt, {0}, {ds ? e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT : e->aspect, 0, 1, 0, 1}},
+                              si = vi; si.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &e->fbm) || vk.vkBindImageMemory(vd.dev, e->fbi, e->fbm, 0) || (vi.subresourceRange.aspectMask && vk.vkCreateImageView(vd.dev, &vi, NULL, &e->fbv)) ||
+            ((e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && vk.vkCreateImageView(vd.dev, &si, NULL, &e->fbsv))) {
             NRED_ONCE("a feedback copy of host image ser=%llu cannot be made: the draw reads zeros", (unsigned long long)e->serial);
-            if (e->fbm) vk.vkFreeMemory(vd.dev, e->fbm, NULL); vk.vkDestroyImage(vd.dev, e->fbi, NULL); e->fbi = VK_NULL_HANDLE; e->fbm = VK_NULL_HANDLE; e->fbv = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
-        static int n; if (n++ < 4) NLOG("feedback copy: host image ser=%llu %ux%u gets a twin that the draws sampling their own target read", (unsigned long long)e->serial, e->w, e->h);
+            if (e->fbv) vk.vkDestroyImageView(vd.dev, e->fbv, NULL);
+            if (e->fbm) vk.vkFreeMemory(vd.dev, e->fbm, NULL); vk.vkDestroyImage(vd.dev, e->fbi, NULL); e->fbi = VK_NULL_HANDLE; e->fbm = VK_NULL_HANDLE; e->fbv = VK_NULL_HANDLE; e->fbsv = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+        static int n; if (n++ < 4) NLOG("feedback copy: host image ser=%llu %ux%u%s gets a twin that the draws sampling their own target read", (unsigned long long)e->serial, e->w, e->h, ds ? " (depth)" : "");
     }
+    g_stat_fb[ds]++; e->fb_ok = 3; e->fb_ep = ep;
     rp_end();
     VkImageMemoryBarrier2 b[2] = {
         {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
@@ -1146,7 +1166,7 @@ static VkImageView fb_copy(vkn_img *e) {
     di.pImageMemoryBarriers = &c; di.imageMemoryBarrierCount = 1;
     vk.vkCmdPipelineBarrier2(cb_now(), &di);
     use_mark(e);
-    return e->fbv;
+    return stencil && ds ? e->fbsv : e->fbv;
 }
 static int g_in_dispatch;   // op_dispatch is resolving its bindings: no pass is open, so the last pass's targets are no feedback loop
 // The stages a target drawn earlier in the submission is made ready for: the one that samples it (st: NVN's stage, 1 fragment, 5 compute, the others before rasterization; -1 all). Mali runs a pass's
@@ -1245,8 +1265,10 @@ static int tex_init_ok(const vkn_img *e, const tex_t *t) {
 // want / comp: the view type and component type the shader declares (-1: a draw with no program, the view's own type); why: what an empty answer means when the texture exists
 // (1 a target of the pass, 2 a cube the shader wants and no host image is one, 3 a component type the image's format has not)
 enum { TL_FEED = 1, TL_CUBE, TL_COMP, TL_3D };
+static char g_tl_what[128];   // what the last tex_lookup found (the red lines of draw_view say it)
 static VkImageView tex_lookup(int tid, int want, int comp, int *why, int st) {
     if (why) *why = 0;
+    g_tl_what[0] = 0;
     if (!tid) return VK_NULL_HANDLE;
     TSA(TS_TLOOK, 1);
     pthread_mutex_lock(&g_rmu);
@@ -1270,11 +1292,18 @@ static VkImageView tex_lookup(int tid, int want, int comp, int *why, int st) {
     if (e && want == VKN_VT_CUBE && !e->cube) { if (why) *why = TL_CUBE; e = NULL; }   // the shader wants a cube, the image cannot be viewed as one
     if (e && want == VKN_VT_3D && e->depth <= 1 && r.t.d.target != NVN_TEXTURE_TARGET_3D) { if (why) *why = TL_3D; e = NULL; }   // the shader wants 3D, the texture is not
     int vc = 0;
-    if (e) { use_mark(e); v = tex_view(e, &r, tid, want, &vc); }
-    if (v && want >= 0 && vc != comp) { if (why) *why = TL_COMP; v = VK_NULL_HANDLE; }   // the view's class (a stencil view reads unsigned integers), not the image format's
+    if (e) { use_mark(e); v = tex_view(e, &r, tid, want, &vc); snprintf(g_tl_what, sizeof g_tl_what, "ser=%llu %ux%u NVN format %#x, Vulkan %d, aspect %#x, view class %d",
+                                                                     (unsigned long long)e->serial, e->w, e->h, e->nvn_fmt, e->fmt, e->aspect, vc); }
+    // A stencil view the shader declares as floats: the translator has no integer texture type and the shader takes the raw bits, as nvn_mtl.m binds Metal's stencil-only view.
+    // Paper Mario: The Thousand-Year Door's reflection pass (reflection.bfsha) reads its mask so. A uint view bound to a float image is undefined in Vulkan: on the RG 476H (Mali-G57) it
+    // greyed Rogueport's walkway (screen luminance 158 -> 137) and drew no reflection, for ~2 ms a frame. Opt-in, DM_VK_STENCIL_RAW=1; by default such a slot reads zeros, as before
+    static int sraw = -1; if (sraw < 0) { const char *x = getenv("DM_VK_STENCIL_RAW"); sraw = x && *x == '1'; }
+    int raw = sraw && v && vc == 1 && comp == 0 && e && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+    if (raw) { static int n; if (n++ < 2) NLOG("texture ID %d: a stencil view sampled as floats is bound as it is (the shader reads the stencil value's bits) (first cases)", tid); }
+    if (v && want >= 0 && vc != comp && !raw) { if (why) *why = TL_COMP; v = VK_NULL_HANDLE; }   // the view's class (a stencil view reads unsigned integers), not the image format's
     pthread_mutex_unlock(&vkn_tmu);
     if (!e && !ts && !TSA(TS_STALE, 1)) NLOG("texture ID %d holds texture ser=%llu, already finalized (first case): an empty slot", tid, (unsigned long long)r.t.serial);
-    if (v && !tex_ready(e, cpu, ts, &r.t, want >= 0, st)) { VkImageView f = want >= 0 ? fb_copy(e) : VK_NULL_HANDLE; if (!f && why) *why = TL_FEED; v = f; }   // its own pass's target: the twin (fb_copy), else zeros
+    if (v && !tex_ready(e, cpu, ts, &r.t, want >= 0, st)) { VkImageView f = want >= 0 ? fb_copy(e, vc == 1) : VK_NULL_HANDLE; if (!f && why) *why = TL_FEED; v = f; }   // its own pass's target: the twin (fb_copy), else zeros
     return v;
 }
 // Sampler parameters → a VkSampler (under g_rmu), as samp_by_id maps them: GL's filters (a min filter without mips: the base level, minLod 0 maxLod 0.25 so a minified sample stays minified),
@@ -1547,12 +1576,12 @@ static void t_report(const char *why) {
     NLOG("textures up to frame %llu (%s), per frame over the last %llu: uploads %.2f (first %.2f, after a guest write %.2f, never protected %.2f), %.1f KiB (%.1f / %.1f / %.1f), writes beside a texture only %.2f, "
          "zero fills %.2f, layout changes %.2f ahead of the submission and %.2f in it, texture lookups %.1f, sampler lookups %.1f, dirty checks %.1f (%.1f us); totals: uploads %llu first, %llu after a guest write, "
          "%llu never protected, %.1f MiB uploaded in all, initial-content fills %llu (%.1f MiB), zero fills %llu, host images made for sampling %llu, CPU-written textures %llu, failed uploads %llu, "
-         "bound while a target %llu, unregistered IDs bound %llu, finalized textures bound %llu, samplers made %llu",
+         "bound while a target %llu, unregistered IDs bound %llu, finalized textures bound %llu, samplers made %llu, feedback copies colour %llu depth %llu reused %llu",
          (unsigned long long)n, why, (unsigned long long)(n - p_n), TD(TS_UP1) + TD(TS_RE) + TD(TS_REALW), TD(TS_UP1), TD(TS_RE), TD(TS_REALW),
          (TD(TS_UP1_B) + TD(TS_RE_B) + TD(TS_REALW_B)) / 1024.0, TD(TS_UP1_B) / 1024.0, TD(TS_RE_B) / 1024.0, TD(TS_REALW_B) / 1024.0, TD(TS_EDGE), TD(TS_ZERO), TD(TS_LAY_UP), TD(TS_LAY_CB),
          TD(TS_TLOOK), TD(TS_SLOOK), TD(TS_CHK), TD(TS_CHK_NS) / 1000.0, (unsigned long long)c[TS_UP1], (unsigned long long)c[TS_RE], (unsigned long long)c[TS_REALW],
          (double)(c[TS_UP1_B] + c[TS_RE_B] + c[TS_REALW_B]) / 1048576.0, (unsigned long long)c[TS_INIT], (double)c[TS_INIT_B] / 1048576.0, (unsigned long long)c[TS_ZERO], (unsigned long long)c[TS_MADE], (unsigned long long)c[TS_CPUW], (unsigned long long)c[TS_FAIL], (unsigned long long)c[TS_FEED], (unsigned long long)c[TS_UNREG], (unsigned long long)c[TS_STALE],
-         (unsigned long long)c[TS_SMADE]);
+         (unsigned long long)c[TS_SMADE], (unsigned long long)g_stat_fb[0], (unsigned long long)g_stat_fb[1], (unsigned long long)g_stat_fb[2]);
 #undef TD
     p_n = n; memcpy(p, c, sizeof p);
     pthread_mutex_unlock(&mu);
@@ -2179,6 +2208,7 @@ static void draw_dyn(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {
         if (b->kind == VKN_B_TEXD) {
             uint64_t h = k < 128 ? (T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; int tid = (int)(h & 0xfffff), why = 0;
             VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
+            if (!v && why) { static int n; if (n++ < 12) NLOG("dynamic array element %d (stage %d, view type %d, class %d): texture ID %d reads the dummy, reason %d (%s) (first cases)", k, st, b->vt, b->comp, tid, why, g_tl_what); }
             if (!v) v = g_dview[b->comp][b->vt];
             out[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, SR_LAYOUT};
         } else {
@@ -2242,12 +2272,18 @@ static void draw_tex_prep(void) {   // a draw with a program: everything said to
 static VkImageView draw_view(int st, const vkn_shader *sh, const vkn_sbind *b) {
     g_tl_from = "draw_view";
     int s = b->reg; uint64_t bit = 1ull << (s & 63); uint8_t want = (uint8_t)(1 + b->vt + 3 * b->comp);
-    if (!(T.td[st][s >> 6] & bit) && T.tvt[st][s] == want) return T.tv[st][s];
+    // A combined slot past 31 shares its c2 word with image slot s - 32, and a bound image is what lies there (nvn_mtl.m tex_slot_h; draw_drv2 fills c2 so): a size query of the image
+    // a compute shader writes. Paper Mario: The Thousand-Year Door's reflection mip chain (reflection.bfsha's compute) asks slots 32-34 for its three levels' sizes; the empty texture
+    // slots gave the dummy's 1x1. Image binds set no dirty bit, so such a slot is resolved at every use. DM_VK_IMGSLOT=0: the texture slot, as before
+    static int imgslot = -1; if (imgslot < 0) { const char *e = getenv("DM_VK_IMGSLOT"); imgslot = !(e && *e == '0'); }
+    uint64_t ih = imgslot && s >= 32 && s - 32 < C2_IMG_SLOTS ? S.img[st][s - 32] : 0;
+    if (!ih && !(T.td[st][s >> 6] & bit) && T.tvt[st][s] == want) return T.tv[st][s];
     T.td[st][s >> 6] &= ~bit; T.tvt[st][s] = want;
-    int tid = (int)(T.tex[st][s] & 0xfffff), why = 0;
+    int tid = (int)((ih ? ih : T.tex[st][s]) & 0xfffff), why = 0;
+    if (ih) { static int n; if (n++ < 4) NLOG("shader %s: texture slot %d reads image slot %d's texture ID %d (first cases)", sh->key, s, s - 32, tid); }
     VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
-    if (why == TL_FEED) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d), a target of the pass it draws in: the slot reads zeros (a copy is a later slice)", sh->key, tid, st, s);
-    else if (why == TL_COMP) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d) as %s, its format is not: the slot reads zeros", sh->key, tid, st, s, b->comp == 1 ? "unsigned integers" : b->comp == 2 ? "signed integers" : "floats");
+    if (why == TL_FEED) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d, %s), a target of the pass it draws in: the slot reads zeros (a copy is a later slice)", sh->key, tid, st, s, g_tl_what);
+    else if (why == TL_COMP) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d, %s) as %s, its format is not: the slot reads zeros", sh->key, tid, st, s, g_tl_what, b->comp == 1 ? "unsigned integers" : b->comp == 2 ? "signed integers" : "floats");
     else if (why == TL_CUBE) { static int n; if (n++ < 8) NLOG("shader %s samples stage %d slot %d as a cube, and texture ID %d is not one this slice has (cube textures are a later slice): the slot reads zeros", sh->key, st, s, tid); }
     else if (why == TL_3D) { static int n; if (n++ < 8) NLOG("shader %s samples stage %d slot %d as a 3D texture (texture ID %d): 3D textures are a later slice, the slot reads zeros", sh->key, st, s, tid); }
     T.tv[st][s] = v;
@@ -2333,6 +2369,7 @@ static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescripto
     return 1;
 }
 static void op_dispatch(const p_dispatch *d) {
+    g_fb_ep++;   // what it writes is not tracked: every feedback copy is made again (fb_copy)
     static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_COMPUTE"); on = !(e && *e == '0'); if (!on) NLOG("DM_VK_COMPUTE=0: dispatches are not run"); }
     if (!on) { tex_bound(1); return; }
     DS(g_disp_n, 1);
@@ -2373,6 +2410,7 @@ static void op_dispatch(const p_dispatch *d) {
 // A copy of a format the device takes as it is copies from the pool's shadow (B marks the source range at the record: b_rec); a BC format decoded on the CPU (vk_bc.c) is read from
 // guest memory now, decoded into a host buffer of this submission and copied from there. 3D textures are a later slice. DM_VK_COPY=0: not done
 static void op_copy_b2t(const p_copy_b2t *c) {
+    g_fb_ep++;   // what it writes is not tracked: every feedback copy is made again (fb_copy)
     if (!copy_on() || !c->tex || !c->tex->serial) return;
     const tex_t *t = c->tex;
     rp_flush();
@@ -2457,6 +2495,12 @@ static void passlog(const op_hdr *h, const uint8_t *a, uint64_t skipped_before) 
     else if (h->op != OP_BIND_IMG && h->op != OP_CLEAR_COLOR && h->op != OP_CLEAR_DS) return;
     NLOG("%s", b);
 }
+// A draw's targets that it may write: their feedback copies are no longer current (fb_copy). Colour targets always; the depth target when depth or stencil is written
+static void draw_fb_mark(const pso_key *k) {
+    for (int i = 0; i < R.n; i++) if (R.ce[i]) R.ce[i]->fb_ok = 0;
+    int sw = 0; for (int f = 0; f < 2; f++) sw |= k->st && (S.st_wmask[f] & 0xff) && (k->sfail[f] || k->szfail[f] || k->szpass[f]);
+    if (R.de) R.de->fb_ok &= (uint8_t)~((k->dw ? 1 : 0) | (sw ? 2 : 0));   // bit 0 the depth part, bit 1 the stencil part
+}
 static int op_draw(const op_hdr *h, const uint8_t *a) {
     int indexed = h->op == OP_DRAW_IDX, prim, itype = 0; int32_t count, first = 0, bvtx = 0, binst, inst; uint64_t ibuf = 0;
     if (indexed) { p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, h->size, &t); prim = d->prim; itype = d->itype; count = d->count; bvtx = d->base_vertex; binst = d->base_instance; inst = d->instances; ibuf = d->ibuf;
@@ -2501,6 +2545,7 @@ static int op_draw(const op_hdr *h, const uint8_t *a) {
     pso_key k; uint32_t zb;
     if (!rp_begin(0)) return draw_skip(DK_STATE);   // no target (said there)
     if (!draw_key(&k, vs, ps, prim, indexed, itype, &zb)) return draw_skip(DK_STATE);
+    draw_fb_mark(&k);
     // Their extent: each stream's fetches end at the last element's start plus the furthest attribute's end. The last element is known for a stream read per instance (instances - 1) and, in a
     // draw without indices, for one read per vertex (first + count - 1): those must end within the pool's own bytes from the bound address (the shadow ends there; Vulkan has no bound past it).
     // A stream read per vertex by an indexed draw is not checked: its bound is the largest index (base vertex added), which only a scan of the guest's indices at each draw would give, and the

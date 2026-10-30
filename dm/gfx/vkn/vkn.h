@@ -98,7 +98,8 @@ typedef struct vkn_img {
     uint8_t *edge[2]; uint32_t edge_n[2];   // its bytes in the pages it shares with other data at each end, as last uploaded: a write there that leaves them as they were uploads nothing (nvn_mtl.m pkg_edges_*)
     struct { uint64_t key; VkImageView v; } sviews[8]; int nsviews;   // sampled views by format, levels, layers, swizzle and aspect (nvn_vk.c img_sview)
     int dead;                            // released by the game, destruction pending
-    VkImage fbi; VkDeviceMemory fbm; VkImageView fbv;   // a copy of level 0, layer 0 for draws that sample the pass's own target (nvn_vk.c fb_copy)
+    VkImage fbi; VkDeviceMemory fbm; VkImageView fbv, fbsv;   // a copy of level 0, layer 0 for draws that sample the pass's own target (nvn_vk.c fb_copy); fbsv: its stencil view
+    uint64_t fb_ep; uint8_t fb_ok;       // which parts of the copy are current (bit 0 colour or depth, bit 1 stencil: cleared by what writes them), in the same write epoch and frame (fb_ep)
     struct vkn_img *next;                // the table's bucket chain, then the pending-destruction list
 } vkn_img;
 vkn_img *vkn_img_get(uint64_t serial);  // under vkn_tmu
