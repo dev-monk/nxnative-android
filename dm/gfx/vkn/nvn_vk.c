@@ -20,6 +20,7 @@
 #include "../tex/nvn_deswizzle.h"
 #include "../../host/dm.h"
 #include <errno.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -770,7 +771,10 @@ static uint64_t g_stat_pend[4];   // deferred, taken as a load op, recorded betw
 static uint64_t g_stat_dsn[2];   // loaded depth / stencil attachments not stored (rp_begin: no draw of the pass writes them)
 static void pend_rec(vkn_img *e, int locked);
 // Opens the pass on the targets. clear_only: attach only the targets with a recorded clear (rp_flush). 0 = nothing to attach (the pass is skipped, as nvn_mtl.m skips one with no texture)
-static unsigned ds_scan(void);
+typedef struct { unsigned w; int64_t x0, y0, x1, y1; } pass_look;   // what the pass may write: depth / stencil bits (ds_writes), and its draws' pixels (x0 > x1: none; full: unknown)
+static pass_look pass_scan(uint32_t fw, uint32_t fh);
+static uint64_t g_stat_area[2];   // passes given a render area smaller than their targets, and the pixels it left out (load and store skip them)
+static int area_on(void) { static int on = -1; if (on < 0) { const char *x = getenv("DM_VK_AREA"); on = !(x && *x == '0'); } return on; }
 static int rp_begin(int clear_only) {
     if (R.on) return 1;
     if (!R.has_rt) { NRED_ONCE("a draw or clear with no render target set: skipped"); clears_reset(); return 0; }
@@ -810,7 +814,7 @@ static int rp_begin(int clear_only) {
         // unchanged tiles itself). ds_scan reads ahead to the pass's end. DM_VK_DIAG=dsnone (wrong on purpose, a bound): a loaded depth / stencil is never stored (39.7 → 37.0 ms, the
         // characters vanish: the gain is in passes that write depth)
         { static int on = -1, dsn; if (on < 0) { const char *x = getenv("DM_VK_DS_STORE"); on = x && *x == '1'; x = getenv("DM_VK_DIAG"); dsn = x && strstr(x, "dsnone"); }
-          unsigned w = dsn ? 0 : !on ? 3 : clear_only ? 0 : (has_d && !R.clear_d) || (has_s && !R.clear_s) ? ds_scan() : 3;
+          unsigned w = dsn ? 0 : !on ? 3 : clear_only ? 0 : (has_d && !R.clear_d) || (has_s && !R.clear_s) ? pass_scan(1, 1).w : 3;
           if (has_d && !R.clear_d && !(w & 1)) { da.storeOp = VK_ATTACHMENT_STORE_OP_NONE; g_stat_dsn[0]++; }
           if (has_s && !R.clear_s && !(w & 2)) { sa.storeOp = VK_ATTACHMENT_STORE_OP_NONE; g_stat_dsn[1]++; } }
         ex[8] = lv_ext(de, R.dlv); if (ex[8].width < w) w = ex[8].width; if (ex[8].height < h) h = ex[8].height;
@@ -839,7 +843,25 @@ static int rp_begin(int clear_only) {
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                          VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
     R.area = (VkExtent2D){w, h}; R.nc = nc; R.hd = has_d; R.hs = has_s;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, R.area}, 1, 0, nc, ca, has_d ? &da : NULL, has_s ? &sa : NULL};
+    // The render area: the part of the targets the pass's draws can reach (their viewport and scissor: pass_scan), rounded out to 32 pixels, where no attachment is cleared by its load
+    // op (that clears the area only) and the scan saw the pass's end. Load and store ops touch only the area, the rest of each target is left as it is: on a tiler a pass drawing a
+    // corner loads and stores only that corner. Paper Mario: The Thousand-Year Door's reflections blur at 320x180 in 960x540 targets, ~7 passes a frame. DM_VK_AREA=0: the whole targets
+    VkRect2D ra = {{0, 0}, R.area};
+    if (area_on() && !clear_only) {
+        int clr = has_d && da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR; clr |= has_s && sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        for (uint32_t i = 0; i < nc; i++) clr |= R.att_c[i] && ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (!clr) {
+            pass_look L = pass_scan(w, h);
+            if (L.x0 > L.x1) L.x0 = L.y0 = L.x1 = L.y1 = 0;   // no draw: an empty pass loads and stores nothing
+            int64_t x0 = L.x0 & ~31, y0 = L.y0 & ~31, x1 = (L.x1 + 31) & ~31, y1 = (L.y1 + 31) & ~31;
+            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > w) x1 = w; if (y1 > h) y1 = h;
+            if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = y1 = 1; }   // an area must not be empty
+            if ((uint64_t)(x1 - x0) * (uint64_t)(y1 - y0) < (uint64_t)w * h) {
+                ra = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+                g_stat_area[0]++; g_stat_area[1] += (uint64_t)w * h - (uint64_t)ra.extent.width * ra.extent.height; }
+        }
+    }
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, ra, 1, 0, nc, ca, has_d ? &da : NULL, has_s ? &sa : NULL};
     vk.vkCmdBeginRendering(cb, &ri);
     R.on = 1; g_stat_pass++;
     return 1;
@@ -1822,35 +1844,46 @@ static unsigned ds_writes(const ds_st *ds, const uint32_t wm[2]) {   // bits 1 d
         for (int f = 0; f < 2; f++) if (wm[f] & 0xff) for (int i = 0; i < 3; i++) if (o[f][i] >= 2 && o[f][i] <= 8) w |= 2; }
     return w;
 }
-// What the pass beginning at the current record may write of its depth target, bits as ds_writes: from that record (the draw or clear that opens it) on, with the bound state as it
-// changes, until a SET_RT of another depth target (no pass keeps its depth across that: rt_sub) or the submission's end (mtl_sub_commit ends the pass). Ends that come sooner
-// (a copy, a barrier, a split) only make the scan longer than the pass: what it finds is still all the pass can write. A clear of depth / stencil counts as both; past 8192 records, both
-static unsigned ds_scan(void) {
-    if (g_xd < 1 || g_xd > 32) return 3;
+// What the pass beginning at the current record may write: of its depth target (bits as ds_writes), and where (the union of its draws' viewport 0 and scissor, as op_draw clips them,
+// 2 pixels wider for wide points and lines). From that record (the draw or clear that opens it) on, with the bound state as it changes, until a SET_RT the pass cannot keep (rt_sub:
+// it ends there) or the submission's end (mtl_sub_commit ends the pass). Ends that come sooner (a copy, a barrier, a split) only make the scan longer than the pass: what it finds
+// still covers the pass. A clear in the pass (vkCmdClearAttachments over the area), a CALL nested too deep or 8192 records: everything (w 3, the full fw x fh)
+static pass_look pass_scan(uint32_t fw, uint32_t fh) {
+    pass_look all = {3, 0, 0, fw, fh}, L = {0, 1, 1, 0, 0};
+    if (g_xd < 1 || g_xd > 32) return all;
     const uint8_t *stk[32]; int d = g_xd - 1, nr = 0; memcpy(stk, g_xp, sizeof(*stk) * (size_t)g_xd);
-    const uint8_t *p = stk[d]; ds_st ds = S.ds; uint32_t wm[2] = {S.st_wmask[0], S.st_wmask[1]}; unsigned w = 0;
+    const uint8_t *p = stk[d]; ds_st ds = S.ds; uint32_t wm[2] = {S.st_wmask[0], S.st_wmask[1]};
+    int hv = S.has_vp, hs = R.has_sc; float vp[4]; memcpy(vp, S.vp[0], sizeof vp); p_scissor sc = R.sc;
     for (int n = 0; n < 8192; n++) {
         op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8;
         switch (h.op) {
             case OP_END:
                 if (d > 0) { p = stk[--d]; memcpy(&h, p, sizeof h); p += h.size; continue; }   // after the caller's CALL
                 if (nr < g_nrest) { p = (const uint8_t *)(uintptr_t)g_rest[nr++]; continue; }
-                return w;
+                return L;
             case OP_JUMP: memcpy(&p, a, 8); continue;
-            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (d >= 31) return 3; stk[d++] = p; p = (const uint8_t *)(uintptr_t)t; continue; }
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (d >= 31) return all; stk[d++] = p; p = (const uint8_t *)(uintptr_t)t; continue; }
             case OP_BIND_STATE: { const p_bind_state *b = (const void *)a; if (b->kind == 5) memcpy(&ds, b->bytes, sizeof ds); break; }
             case OP_STENCIL: { const p_stencil *b = (const void *)a; if (b->which == 1) for (int f = 0; f < 2; f++) if (b->face & (1 << f)) wm[f] = (uint32_t)b->mask; break; }
-            case OP_DRAW: case OP_DRAW_IDX: w |= ds_writes(&ds, wm); if (w == 3) return 3; break;
-            case OP_CLEAR_DS: return 3;
-            case OP_SET_RT: { const p_set_rt *r = (const p_set_rt *)a; const tex_t *t = r->depth; uint64_t ser = t ? t->serial : 0;
-                uint32_t dl = t && r->has_dview && r->dview.set_levels ? r->dview.base_level : 0, dy = t && r->has_dview && r->dview.set_layers ? r->dview.min_layer : 0;
-                if (ser != R.dser || (ser && (dl != R.dlv || dy != R.dly))) return w;
+            case OP_VIEWPORTS: { const p_viewports *b = (const void *)a; if (b->first == 0 && b->n > 0 && b->n <= 16) { memcpy(vp, b->v[0], sizeof vp); hv = 1; } break; }
+            case OP_SCISSOR: memcpy(&sc, a, sizeof sc); hs = 1; break;
+            case OP_DRAW: case OP_DRAW_IDX: {
+                L.w |= ds_writes(&ds, wm);
+                double x0 = 0, y0 = 0, x1 = fw, y1 = fh;
+                if (hv) { x0 = vp[0]; y0 = vp[1]; x1 = (double)vp[0] + vp[2]; y1 = (double)vp[1] + vp[3]; if (!(x1 > x0) || !(y1 > y0)) break; }   // op_draw skips it
+                if (hs) { if (sc.x > x0) x0 = sc.x; if (sc.y > y0) y0 = sc.y; if ((double)sc.x + sc.w < x1) x1 = (double)sc.x + sc.w; if ((double)sc.y + sc.h < y1) y1 = (double)sc.y + sc.h; }
+                if (!(x1 > x0) || !(y1 > y0)) break;
+                int64_t ix0 = (int64_t)floor(x0) - 2, iy0 = (int64_t)floor(y0) - 2, ix1 = (int64_t)ceil(x1) + 2, iy1 = (int64_t)ceil(y1) + 2;
+                if (L.x0 > L.x1) { L.x0 = ix0; L.y0 = iy0; L.x1 = ix1; L.y1 = iy1; }
+                else { if (ix0 < L.x0) L.x0 = ix0; if (iy0 < L.y0) L.y0 = iy0; if (ix1 > L.x1) L.x1 = ix1; if (iy1 > L.y1) L.y1 = iy1; }
                 break; }
+            case OP_CLEAR_COLOR: case OP_CLEAR_DS: return all;
+            case OP_SET_RT: if (rt_sub((const p_set_rt *)a) < 0) return L; break;
             default: break;
         }
         p += h.size;
     }
-    return 3;
+    return all;
 }
 
 // Statistics (draw_report): draws recorded (indexed among them), skipped by why; pipelines made, their creation time, cache hits; descriptor pushes, writes, dummies; uniform bindings, those at
@@ -2962,9 +2995,9 @@ void mtl_finish(void) { uint64_t f = atomic_load(&g_fence); while (!mtl_wait(f, 
 static void surf_report(const char *why);
 static void vkn_report(const char *why) {   // the backend's own line beside the surface one: what reached the GPU
     pthread_mutex_lock(&vkn_tmu); uint64_t ni = g_nimg, ib = g_img_b, gp = g_ghost_puts; pthread_mutex_unlock(&vkn_tmu);
-    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu (deferred %llu: taken by a pass %llu, recorded between passes %llu / after ending one %llu), clears in a pass %llu, oversize clears in a pass of their own %llu, depth / stencil not stored %llu / %llu, barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
+    NLOG("GPU work up to frame %llu (%s): submissions %llu, passes %llu, clears folded into load ops %llu (deferred %llu: taken by a pass %llu, recorded between passes %llu / after ending one %llu), clears in a pass %llu, oversize clears in a pass of their own %llu, depth / stencil not stored %llu / %llu, smaller render areas %llu (%llu pixels left out), barriers %llu, kept open across %llu SET_RT / %llu barriers, barriers for a further sampling stage %llu (%llu ended a pass); host images %llu (%llu B, ghosts included), ghosts made %llu; validation %s %llu",
          (unsigned long long)atomic_load(&g_present_n), why, (unsigned long long)atomic_load(&g_fence), (unsigned long long)g_stat_pass, (unsigned long long)g_stat_fold, (unsigned long long)g_stat_pend[0], (unsigned long long)g_stat_pend[1], (unsigned long long)g_stat_pend[2], (unsigned long long)g_stat_pend[3], (unsigned long long)g_stat_clr_mid,
-         (unsigned long long)g_stat_own, (unsigned long long)g_stat_dsn[0], (unsigned long long)g_stat_dsn[1], (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)g_stat_sr_more, (unsigned long long)g_stat_sr_split, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
+         (unsigned long long)g_stat_own, (unsigned long long)g_stat_dsn[0], (unsigned long long)g_stat_dsn[1], (unsigned long long)g_stat_area[0], (unsigned long long)g_stat_area[1], (unsigned long long)g_stat_bar, (unsigned long long)g_stat_keep_rt, (unsigned long long)g_stat_keep_bar, (unsigned long long)g_stat_sr_more, (unsigned long long)g_stat_sr_split, (unsigned long long)ni, (unsigned long long)ib, (unsigned long long)gp, vd.validation ? "on, messages" : "off", (unsigned long long)vkn_validation_count());
 }
 #define STATS_FROM 60   // no statistics line before this present: the parity cut ends at the host's own line of present 1 or 2 (parity.py PRESENT), and lines before it must be the HLE's alone
 // The suspend path's bound (mtl_drain): Android calls it on the UI thread (front_android.c on_stop → dm_gfx_suspend), where a GPU that hangs must not hang the app into an ANR, the same 4 s as
