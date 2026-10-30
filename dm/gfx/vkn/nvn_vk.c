@@ -588,6 +588,12 @@ count:
 }
 // DM_VK_STORAGE_SER=<ser>[,<ser>…] (an experiment): only those images get STORAGE usage (the ones the dispatches write, logged as "writes ser=… as a storage image"); every other colour
 // image keeps its compression (AFBC on Mali: STORAGE usage turns it off). A dispatch writing an image not in the list is skipped (said in red)
+// STORAGE usage turns compression (AFBC) off on Mali, so by default no image is made with it: a dispatch that binds one as a storage image first remakes it with STORAGE (cs_storage_up).
+// DM_VK_STORAGE_IMG=1: every colour image whose format allows it gets STORAGE when made (as before, with DM_VK_STORAGE_SER narrowing it); =0: none ever (its dispatches are skipped)
+static int g_mk_storage;   // img_make for a dispatch's storage image: it gets STORAGE now
+static int storage_mode(void) { static int m = -1; if (m < 0) { const char *x = getenv("DM_VK_STORAGE_IMG"); m = x && *x == '0' ? 0 : x && *x == '1' ? 1 : 2; } return m; }
+static int storage_ser(uint64_t ser);
+static int storage_want(uint64_t ser) { int m = storage_mode(); return m == 1 ? storage_ser(ser) : m == 2 && g_mk_storage; }
 static int storage_ser(uint64_t ser) {
     static const char *l = (const char *)1; if (l == (const char *)1) l = getenv("DM_VK_STORAGE_SER");
     if (!l || !*l) return 1;
@@ -619,7 +625,7 @@ static vkn_img *img_make(const tex_t *t, const char *why, int want) {
     VkImageUsageFlags u = (!is3d && ff & (col ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ? (col ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) : 0)
                         | (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) | (ff & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)
                         | (ff & VK_FORMAT_FEATURE_TRANSFER_DST_BIT ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0)
-                        | (col && sf == f && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !(getenv("DM_VK_STORAGE_IMG") && *getenv("DM_VK_STORAGE_IMG") == '0') && storage_ser(t->serial) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);   // compute shaders write it as an image (op_dispatch); not with a second view format (its views would inherit the usage), DM_VK_STORAGE_IMG=0: never
+                        | (col && sf == f && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && storage_want(t->serial) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);   // compute shaders write it as an image (op_dispatch: see storage_mode); not with a second view format (its views would inherit the usage)
     VkFormat fl[2] = {f, sf}; VkImageFormatListCreateInfo li = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, fl};   // the two formats it is viewed as (a driver may keep its compression)
     int cubec = cube_on && !is3d && w == h && layers >= 6 && layers % 6 == 0;   // square with whole sets of six layers: a game may view it as a cube (TTYD's lighting probes)
     VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, sf != f ? &li : NULL, (sf != f ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) | (cubec ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0), is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, f, {w, h, dz}, lv, layers, VK_SAMPLE_COUNT_1_BIT,
@@ -2626,7 +2632,7 @@ static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescripto
                 if (r->has_v && r->v.set_levels) lv = r->v.base_level; if (r->has_v && r->v.set_layers) ly = r->v.min_layer; }
             pthread_mutex_unlock(&g_rmu);
             pthread_mutex_lock(&vkn_tmu);
-            if (ser && !(e = vkn_img_get(ser))) e = img_make(&tt, "a compute shader's storage image", NVK_RT);
+            if (ser && !(e = vkn_img_get(ser))) { g_mk_storage = 1; e = img_make(&tt, "a compute shader's storage image", NVK_RT); g_mk_storage = 0; }
             if (e && (e->usage & VK_IMAGE_USAGE_STORAGE_BIT) && nofmt_write_ok(e->fmt) && lv < e->levels && ly < e->layers) { use_mark(e); v = vkn_img_view(e, lv, ly, 0); }
             pthread_mutex_unlock(&vkn_tmu);
             if (!v) { NRED_ONCE("compute shader %s: image slot %u (texture ID %d, ser=%llu) has no host image this device can write as storage: the dispatch is skipped", sh->key, b->reg, tid, (unsigned long long)ser); return 0; }
@@ -2643,6 +2649,62 @@ static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescripto
     return 1;
 }
 static uint64_t g_stat_cs_gen;   // sampled descriptors of a dispatch's own storage images, given the general layout (op_dispatch)
+// A host image a dispatch writes, made without STORAGE (storage_mode 2): remade with it, in place. The new image gets the old one's content (every level and layer, copied in this
+// submission, outside a pass) and its layout; the old image and its views go to the pending-destruction list as a husk, freed once this submission has completed. Views made of it are
+// made again (g_reg_gen). The present reads the image under vkn_tmu and the published layout under vkn_qmu: that layout is set to undefined until this submission's commit, so a present
+// in between shows the image black rather than sampling it in a wrong layout. Under vkn_qmu, then vkn_tmu (the present's order)
+static uint64_t g_stor_up;
+static void cs_storage_up(vkn_img *e) {
+    if (!e || storage_mode() != 2 || e->usage & VK_IMAGE_USAGE_STORAGE_BIT || e->aspect != VK_IMAGE_ASPECT_COLOR_BIT || e->sfmt != e->fmt || !(fmt_feat(e->fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return;
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, e->cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, e->depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, e->fmt, {e->w, e->h, e->depth},
+        e->levels, e->layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, e->usage | VK_IMAGE_USAGE_STORAGE_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage im; VkDeviceMemory m = VK_NULL_HANDLE; VkMemoryRequirements mr; int mt;
+    if (vk.vkCreateImage(vd.dev, &ii, NULL, &im)) { NRED_ONCE("host image ser=%llu could not be remade with storage usage: its dispatches are skipped", (unsigned long long)e->serial); return; }
+    vk.vkGetImageMemoryRequirements(vd.dev, im, &mr);
+    if ((mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) < 0) mt = vkn_mem_type(mr.memoryTypeBits, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+    if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &m) || vk.vkBindImageMemory(vd.dev, im, m, 0)) {
+        NRED_ONCE("device memory for host image ser=%llu with storage usage failed: its dispatches are skipped", (unsigned long long)e->serial);
+        if (m) vk.vkFreeMemory(vd.dev, m, NULL); vk.vkDestroyImage(vd.dev, im, NULL); return; }
+    VkImageLayout L = rec_layout(e); VkCommandBuffer cb = cb_now(); VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    if (L != VK_IMAGE_LAYOUT_UNDEFINED && e->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        VkImageMemoryBarrier2 b[2] = {
+            {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+             L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, e->img, all},
+            {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im, all}};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 2, b}; vk.vkCmdPipelineBarrier2(cb, &di);
+        VkImageCopy rg[16]; uint32_t n = e->levels < 16 ? e->levels : 16;
+        for (uint32_t l = 0; l < n; l++) {
+            uint32_t w = e->w >> l, h = e->h >> l, dz = e->depth >> l;
+            rg[l] = (VkImageCopy){{VK_IMAGE_ASPECT_COLOR_BIT, l, 0, e->layers}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, e->layers}, {0, 0, 0}, {w ? w : 1, h ? h : 1, dz ? dz : 1}};
+        }
+        vk.vkCmdCopyImage(cb, e->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, rg);
+        VkImageMemoryBarrier2 a = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, L, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im, all};
+        di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &a; vk.vkCmdPipelineBarrier2(cb, &di);
+    } else e->rec = VK_IMAGE_LAYOUT_UNDEFINED;   // nothing worth keeping (or it cannot be copied): the new image starts undefined
+    vkn_img *h = calloc(1, sizeof *h); if (!h) die("vkn backend: image entry allocation failed");
+    h->serial = e->serial; h->img = e->img; h->mem = e->mem; h->aspect = e->aspect; h->use_pres = e->use_pres; use_mark(h);
+    memcpy(h->views, e->views, sizeof e->views); h->nviews = e->nviews; memcpy(h->sviews, e->sviews, sizeof e->sviews); h->nsviews = e->nsviews;
+    img_dead(h);
+    e->img = im; e->mem = m; e->nviews = e->nsviews = 0; e->usage |= VK_IMAGE_USAGE_STORAGE_BIT; e->layout = VK_IMAGE_LAYOUT_UNDEFINED; g_img_b += mr.size;
+    atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_release);
+    if (g_stor_up++ < 24) NLOG("host image ser=%llu %ux%u format %d remade with storage usage for a dispatch (its content %s)", (unsigned long long)e->serial, e->w, e->h, e->fmt,
+                               L != VK_IMAGE_LAYOUT_UNDEFINED && e->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT ? "copied" : "undefined");
+}
+// The storage images a dispatch binds (as cs_binds finds them): each made without STORAGE is remade with it first (cs_storage_up)
+static void cs_storage_prep(const vkn_shader *sh) {
+    if (storage_mode() != 2) return;
+    for (int i = 0; i < sh->nb; i++) { const vkn_sbind *b = &sh->b[i]; if (b->kind != VKN_B_IMG) continue;
+        int tid = (int)(S.img[5][b->reg] & 0xfffff); uint64_t ser = 0;
+        pthread_mutex_lock(&g_rmu); if (tid && tid < g_ntreg && g_treg[tid].ok) ser = g_treg[tid].t.serial; pthread_mutex_unlock(&g_rmu);
+        if (!ser) continue;
+        pthread_mutex_lock(&vkn_qmu); pthread_mutex_lock(&vkn_tmu);
+        vkn_img *e = vkn_img_get(ser); if (e && !(e->usage & VK_IMAGE_USAGE_STORAGE_BIT)) cs_storage_up(e);
+        pthread_mutex_unlock(&vkn_tmu); pthread_mutex_unlock(&vkn_qmu);
+    }
+}
 static void op_dispatch(const p_dispatch *d) {
     g_fb_ep++;   // what it writes is not tracked: every feedback copy is made again (fb_copy)
     static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_COMPUTE"); on = !(e && *e == '0'); if (!on) NLOG("DM_VK_COMPUTE=0: dispatches are not run"); }
@@ -2656,6 +2718,7 @@ static void op_dispatch(const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     g_disp_dim[0] = (uint32_t)d->x; g_disp_dim[1] = (uint32_t)d->y; g_disp_dim[2] = (uint32_t)d->z;
     rp_flush(); pend_all();   // its storage images and buffers: whatever it reads or writes sees the clears
+    cs_storage_prep(sh);
     draw_tex_prep();
     VkDescriptorImageInfo ii[VKN_MAXB]; VkDescriptorBufferInfo bi[VKN_MAXB]; VkWriteDescriptorSet wr[VKN_MAXB]; vkn_img *imgs[VKN_MAXB]; int ni = 0;
     g_in_dispatch = 1; int ok = cs_binds(sh, ii, bi, wr, imgs, &ni); g_in_dispatch = 0;
