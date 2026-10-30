@@ -366,7 +366,125 @@ static int c1_make(vkn_shader *sh, const char *hex, char *why, size_t wn) {
 // bitcast, then the array's access chain index) becomes: x below 32 as before (c2's slot indices, draw_drv2), else the slot k whose bound handle has that ID (texture part
 // for a texture array, sampler part for a sampler array), from a 32-word push constant table (nvn_vk.c draw_idmap: slot k's handle, as element k holds it), else 31.
 // Returns the new module (malloc) and its size, or NULL: nothing to change. DM_VK_IDMAP=0: not done
-static int g_ida[4];   // modules rewritten, texture clamps, sampler clamps, clamps left as selects (a loop header or continue target)
+// A float-declared 2D texture whose reads are used only as bits (each read's components, directly or through a local, go only into OpBitcast to int / uint): the Switch returns an
+// integer texture's bits through a float sampler, and Paper Mario: The Thousand-Year Door's reflection masks and lighting read the depth-stencil's stencil view so (floatBitsToInt(x) & 1);
+// Vulkan has no float read of a stencil view (it read zeros: no reflection). The binding becomes a uint image (comp 1, so the host binds the stencil view), each read returns uvec4
+// under a new id, and an OpBitcast to the old type takes the old id: every use is unchanged. Returns the new module (malloc), or NULL: nothing to change. DM_VK_BITS=0: not done
+static int g_ida[4], g_bits_n;   // spv_idmap: modules rewritten, texture clamps, sampler clamps, clamps left as selects (a loop header or continue target); spv_bits: modules rewritten
+static int spv_is_int(const uint32_t *w, size_t nw, uint32_t t) {   // t is a 32-bit int type
+    for (size_t i = 5; i < nw; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (op == 54) break; if (op == 21 && w[i + 1] == t && w[i + 2] == 32) return 1; i += wc; }
+    return 0;
+}
+static uint32_t *spv_bits(const uint32_t *w, size_t nw, vkn_shader *sh, size_t *onw, int *nfix) {
+    enum { MAXV = 8, MAXU = 256 };
+    size_t first_fn = 0; uint32_t bound = w[3], tu = 0, tu4 = 0, tf4 = 0, var[MAXV], vimg[MAXV]; int vb[MAXV], nv = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 54) { first_fn = i; break; }
+        if (op == 21 && wc == 4 && w[i + 2] == 32 && !w[i + 3]) tu = w[i + 1];
+        if (op == 71 && wc >= 4 && w[i + 2] == 33 && nv < MAXV)   // Binding: a float 2D combined texture of the reflection
+            for (int b = 0; b < sh->nb; b++) if (sh->b[b].binding == w[i + 3] && sh->b[b].kind == VKN_B_TEX && !sh->b[b].comp && sh->b[b].vt == VKN_VT_2D) { var[nv] = w[i + 1]; vb[nv++] = b; }
+        i += wc;
+    }
+    if (!first_fn || !tu || !nv) return NULL;
+    for (size_t i = 5; i < first_fn; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 23 && wc == 4 && w[i + 3] == 4) { if (w[i + 2] == tu) tu4 = w[i + 1]; }   // OpTypeVector uint 4
+        i += wc; }
+    // Per variable: its pointer → sampled image → image types, and whether every read is used as bits only
+    size_t vpos[MAXV] = {0}; int ok[MAXV] = {0}, nfx = 0;
+    for (int v = 0; v < nv; v++) {
+        uint32_t pt = 0, si = 0;
+        for (size_t i = 5; i < first_fn; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (op == 59 && w[i + 2] == var[v]) { pt = w[i + 1]; vpos[v] = i; } i += wc; }
+        for (size_t i = 5; i < first_fn; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (op == 32 && w[i + 1] == pt) si = w[i + 3]; i += wc; }
+        for (size_t i = 5; i < first_fn; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (op == 27 && w[i + 1] == si) vimg[v] = w[i + 2]; i += wc; }
+        if (!vpos[v] || !si || !vimg[v]) continue;
+        // ids derived from it: loads (sampled image), OpImage, reads (Fetch 95, SampleImplicit 87, SampleExplicit 88, Gather 96)
+        uint32_t L[MAXU], R[MAXU], E[MAXU], X[MAXU], Y[MAXU]; int nl = 0, nr = 0, ne = 0, nx = 0, ny = 0, bad = 0;
+        for (size_t i = first_fn; i < nw && !bad; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+            if (op == 61 && w[i + 3] == var[v] && nl < MAXU) L[nl++] = w[i + 2];
+            if (op == 100) for (int k = 0; k < nl; k++) if (w[i + 3] == L[k] && nl < MAXU) L[nl++] = w[i + 2];
+            if (op == 95 || op == 87 || op == 88 || op == 96) for (int k = 0; k < nl; k++) if (w[i + 3] == L[k]) { if (nr < MAXU) R[nr++] = w[i + 2]; tf4 = tf4 ? tf4 : w[i + 1]; if (w[i + 1] != tf4) bad = 1; }
+            i += wc; }
+        if (!nr || bad) continue;
+        // every use of a read: OpCompositeExtract; of an extract: OpBitcast to int / uint, or OpStore into a local whose loads go only into such bitcasts
+        for (size_t i = first_fn; i < nw && !bad; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+            for (int k = 0; k < nr; k++) for (uint32_t a = 1; a < wc; a++) if (w[i + a] == R[k]) {
+                if (op == 81 && a == 3 && ne < MAXU) E[ne++] = w[i + 2];
+                else if (!((op == 95 || op == 87 || op == 88 || op == 96) && a == 2)) bad = 1; }
+            i += wc; }
+        for (size_t i = first_fn; i < nw && !bad; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+            for (int k = 0; k < ne; k++) for (uint32_t a = 1; a < wc; a++) if (w[i + a] == E[k]) {
+                if (op == 124 && a == 3 && spv_is_int(w, nw, w[i + 1])) {}
+                else if (op == 62 && a == 2 && nx < MAXU) X[nx++] = w[i + 1];
+                else if (!(op == 81 && a == 2)) bad = 1; }
+            i += wc; }
+        for (size_t i = first_fn; i < nw && !bad; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;   // the locals: stored only from these extracts; their loads
+            for (int k = 0; k < nx; k++) if (op == 62 && w[i + 1] == X[k]) { int f = 0; for (int q = 0; q < ne; q++) f |= w[i + 2] == E[q]; if (!f) bad = 1; }
+            for (int k = 0; k < nx; k++) if (op == 61 && w[i + 3] == X[k] && ny < MAXU) Y[ny++] = w[i + 2];
+            i += wc; }
+        for (size_t i = first_fn; i < nw && !bad; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+            for (int k = 0; k < ny; k++) for (uint32_t a = 1; a < wc; a++) if (w[i + a] == Y[k] && !(op == 61 && a == 2) && !(op == 124 && a == 3 && spv_is_int(w, nw, w[i + 1]))) bad = 1;
+            i += wc; }
+        ok[v] = !bad;
+    }
+    int any = 0; for (int v = 0; v < nv; v++) any |= ok[v];
+    if (!any || !tf4) return NULL;
+    { int vec4 = 0; size_t upos = 0;   // the reads' type is a 4-vector (the uvec4 bitcasts to it), and uint is declared before the first variable rewritten
+      for (size_t i = 5; i < first_fn; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (op == 23 && w[i + 1] == tf4 && w[i + 3] == 4) vec4 = 1; if (op == 21 && w[i + 1] == tu) upos = i; i += wc; }
+      for (int v = 0; v < nv; v++) if (ok[v] && vpos[v] < upos) ok[v] = 0;
+      if (!vec4) return NULL; }
+    // The image type with a uint sampled type, its sampled image and pointer: new ids, declared before the first variable rewritten (uint and its vector before it)
+    size_t ins = 0; for (int v = 0; v < nv; v++) if (ok[v] && (!ins || vpos[v] < ins)) ins = vpos[v];
+    uint32_t nimg[MAXV], nsi[MAXV], nptr[MAXV], ntu4 = tu4 ? tu4 : bound++;
+    size_t cap = nw + 16 + (size_t)nv * 24 + 4096; uint32_t *o = malloc(cap * 4); if (!o) return NULL;
+    size_t n = 5; memcpy(o, w, 20);
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (i == ins) {
+            if (!tu4) { o[n++] = 4u << 16 | 23; o[n++] = ntu4; o[n++] = tu; o[n++] = 4; }
+            for (int v = 0; v < nv; v++) if (ok[v]) {   // an identical uint image type (or one made for an earlier variable) and its sampled image are reused: non-aggregate types are unique
+                const uint32_t *fi = NULL; uint32_t fc = 0;
+                for (size_t j = 5; j < first_fn; ) { uint32_t o2 = w[j] & 0xffff, c2 = w[j] >> 16; if (o2 == 25 && w[j + 1] == vimg[v]) { fi = w + j; fc = c2; } j += c2; }
+                nimg[v] = nsi[v] = 0;
+                for (int q = 0; q < v; q++) if (ok[q] && vimg[q] == vimg[v]) { nimg[v] = nimg[q]; nsi[v] = nsi[q]; }
+                for (size_t j = 5; j < first_fn && !nimg[v] && fi; ) { uint32_t o2 = w[j] & 0xffff, c2 = w[j] >> 16;
+                    if (o2 == 25 && c2 == fc && w[j + 2] == tu && !memcmp(w + j + 3, fi + 3, (fc - 3) * 4)) nimg[v] = w[j + 1]; j += c2; }
+                for (size_t j = 5; j < first_fn && nimg[v] && !nsi[v]; ) { uint32_t o2 = w[j] & 0xffff, c2 = w[j] >> 16; if (o2 == 27 && w[j + 2] == nimg[v]) nsi[v] = w[j + 1]; j += c2; }
+                if (!nimg[v]) { nimg[v] = bound++; memcpy(o + n, fi, fc * 4); o[n + 1] = nimg[v]; o[n + 2] = tu; n += fc; }
+                if (!nsi[v]) { nsi[v] = bound++; o[n++] = 3u << 16 | 27; o[n++] = nsi[v]; o[n++] = nimg[v]; }
+                nptr[v] = bound++; o[n++] = 4u << 16 | 32; o[n++] = nptr[v]; o[n++] = 0; o[n++] = nsi[v];   // UniformConstant
+            }
+        }
+        if (n + wc + 8 > cap) { free(o); return NULL; }
+        memcpy(o + n, w + i, wc * 4);
+        for (int k = 0; k < nv; k++) if (ok[k]) {
+            if (op == 59 && w[i + 2] == var[k]) o[n + 1] = nptr[k];   // the variable
+            if (op == 61 && w[i + 3] == var[k]) o[n + 1] = nsi[k];    // its loads
+        }
+        n += wc; i += wc;
+    }
+    // Second walk over the output: OpImage of a rewritten load gets the uint image type; each read of one returns uvec4 under a new id, bitcast back to the old id
+    uint32_t lds[64], lv[64]; int nld = 0;
+    for (size_t i = 5; i < n; ) { uint32_t op = o[i] & 0xffff, wc = o[i] >> 16;
+        if (op == 61) for (int k = 0; k < nv; k++) if (ok[k] && o[i + 1] == nsi[k] && nld < 64) { lds[nld] = o[i + 2]; lv[nld++] = (uint32_t)k; }
+        if (op == 100) for (int k = 0; k < nld; k++) if (o[i + 3] == lds[k] && nld < 64) { o[i + 1] = nimg[lv[k]]; lds[nld] = o[i + 2]; lv[nld++] = lv[k]; break; }
+        i += wc; }
+    uint32_t *p = malloc((n + (size_t)nld * 8 + 64) * 4); if (!p) { free(o); return NULL; }
+    size_t m = 0;
+    for (size_t i = 0; i < n; ) {
+        uint32_t op = i < 5 ? 0 : o[i] & 0xffff, wc = i < 5 ? 5 : o[i] >> 16;
+        int hit = 0; if (op == 95 || op == 87 || op == 88 || op == 96) for (int k = 0; k < nld; k++) hit |= o[i + 3] == lds[k];
+        memcpy(p + m, o + i, wc * 4);
+        if (hit) { uint32_t old = o[i + 2], nu = bound++; p[m + 1] = ntu4; p[m + 2] = nu; m += wc; p[m++] = 4u << 16 | 124; p[m++] = tf4; p[m++] = old; p[m++] = nu; nfx++; }
+        else m += wc;
+        i += wc;
+    }
+    free(o);
+    for (int v = 0; v < nv; v++) if (ok[v]) sh->b[vb[v]].comp = 1;
+    g_bits_n++;
+    p[3] = bound; *onw = m; *nfix = nfx;
+    return p;
+}
 static uint32_t *spv_idmap(const uint32_t *w, size_t nw, const vkn_shader *sh, size_t *onw, int *nfix) {
     enum { MAXA = 16, MAXF = 64 };
     uint32_t bound = w[3], glsl = 0, tu = 0, tb = 0, arr[MAXA], c31[8]; int ak[MAXA], na = 0, nc = 0;
@@ -507,7 +625,9 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
         if (!*why) {
             static int idm = -1; if (idm < 0) { const char *x = getenv("DM_VK_IDMAP"); idm = !(x && *x == '0'); }
             size_t mn = nbytes / 4; uint32_t *ms = spv; int nfix = 0;
-            if (idm && sh->dyn && (stage == 1 || stage == 5)) { uint32_t *p = spv_idmap(spv, nbytes / 4, sh, &mn, &nfix); if (p) { ms = p; sh->idmap = nfix; } else mn = nbytes / 4; }
+            static int bits = -1; if (bits < 0) { const char *x = getenv("DM_VK_BITS"); bits = !(x && *x == '0'); }
+            if (bits && (stage == 1 || stage == 5)) { int nb2 = 0; uint32_t *p = spv_bits(spv, nbytes / 4, sh, &mn, &nb2); if (p) { ms = p; sh->bits = nb2; static int nl; if (nl++ < 4) VLOG("shader %s: %d texture reads used only as bits read a uint image (a stencil view: first cases)", hk, nb2); } else mn = nbytes / 4; }
+            if (idm && sh->dyn && (stage == 1 || stage == 5)) { size_t in = mn; uint32_t *p = spv_idmap(ms, in, sh, &mn, &nfix); if (p) { if (ms != spv) free(ms); ms = p; sh->idmap = nfix; } else mn = in; }
             { const char *dd = getenv("DM_VK_IDMAP_DUMP"); if (dd && *dd && ms != spv) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_IDMAP_DUMP=<dir>: the rewritten modules, for spirv-val
             VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, mn * 4, ms};
             VkResult r = vk.vkCreateShaderModule(vd.dev, &ci, NULL, &sh->mod);
@@ -550,13 +670,13 @@ static void idmap_all(void) {
     while (d && (de = readdir(d))) {
         size_t l = strlen(de->d_name); if (l != 23 || strcmp(de->d_name + 16, "_b.json")) continue;
         char p[1024]; snprintf(p, sizeof p, "%s/%s", g_dir, de->d_name); char *j = slurp(p, NULL);
-        int st = j && strstr(j, "_cb0_40000000") ? (strstr(j, "\"stage\": \"ps\"") ? 1 : strstr(j, "\"stage\": \"cs\"") ? 5 : -1) : -1; free(j);
+        int st = j && (strstr(j, "_cb0_40000000") || strstr(j, "\"comp\": \"float\"")) ? (strstr(j, "\"stage\": \"ps\"") ? 1 : strstr(j, "\"stage\": \"cs\"") ? 5 : -1) : -1; free(j);
         if (st < 0) continue;
         uint8_t k[8]; for (int i = 0; i < 8; i++) { unsigned v; sscanf(de->d_name + 2 * i, "%2x", &v); k[i] = (uint8_t)v; }
         vkn_shader_get(k, st); n++;
     }
     if (d) closedir(d);
-    VLOG("DM_VK_IDMAP_ALL: %d shaders with tex_dyn_slots arrays loaded: %d rewritten, %d texture and %d sampler clamps, %d of them as selects", n, g_ida[0], g_ida[1], g_ida[2], g_ida[3]);
+    VLOG("DM_VK_IDMAP_ALL: %d pixel and compute shaders with tex_dyn_slots arrays or float textures loaded (bit reads rewritten in %d): %d rewritten, %d texture and %d sampler clamps, %d of them as selects", n, g_bits_n, g_ida[0], g_ida[1], g_ida[2], g_ida[3]);
 }
 // The tests' modules (t_vkn.c): a map entry and a module from memory, as if read from the directory
 vkn_shader *vkn_shader_add(const uint8_t key[8], int stage, const char *json, const uint32_t *spv, size_t nbytes) {

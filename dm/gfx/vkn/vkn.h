@@ -141,6 +141,7 @@ typedef struct vkn_shader {
     uint32_t io_mask; uint8_t io_ct[32], io_n[32];    // the interface between the stages, by location: a vertex shader's outputs, a pixel shader's inputs (component type as comp, components)
     uint8_t io_first[32], io_nd[32], io_dims[32][4];  // and the variable on each: its first location and array lengths (outermost first; io_nd 0: no array, io_first the location)
     int dyn;                                          // has TEXD / SAMPD bindings: c2 holds slot indices for it (draw_drv2)
+    int bits;                                         // texture reads used only as bits that read a uint image (vk_shader.c spv_bits): their bindings' comp is uint
     int idmap;                                        // TEXD / SAMPD indices looked up in the slots' handles (vk_shader.c spv_idmap): the 32-word push constant table (nvn_vk.c draw_idmap)
     int dual;                                         // a pixel shader with an Output decorated Index other than 0 (dual-source blending's second colour)
     VkBuffer c1_buf; VkDeviceMemory c1_mem; uint32_t c1_n;
