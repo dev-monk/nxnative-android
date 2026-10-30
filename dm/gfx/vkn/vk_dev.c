@@ -278,7 +278,7 @@ int vkn_dev_init(void) {
       VLOG("storage images without format: write %s, read %s%s", vd.nofmt_w ? "on" : "off", vd.nofmt_r ? "on" : "off", on ? "" : " (DM_VK_NOFMT=0)"); }
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(vd.pd, NULL, &nde, de);
-    const char *dx[6]; uint32_t ndx = 0;
+    const char *dx[8]; uint32_t ndx = 0;
     // The draw's resources go in one push-descriptor set (nvn_vk.c draw_desc); near = -w clips as NVN's default does with depth clip control's negativeOneToOne (mtl_set_depth_zero). Without
     // either nothing is drawn (said once at the first draw)
     if (has_ext(de, nde, "VK_KHR_push_descriptor")) {
@@ -291,6 +291,13 @@ int vkn_dev_init(void) {
         VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dcc}; vk.vkGetPhysicalDeviceFeatures2(vd.pd, &q2);
         if (dcc.depthClipControl) { dx[ndx++] = "VK_EXT_depth_clip_control"; dcc.pNext = w12.pNext; w12.pNext = &dcc; vd.clip_ctl = 1; }
     }
+    // DM_VK_DIAG=afbc (diagnostics): VK_EXT_image_compression_control, to ask the driver whether each kind of host image is compressed (AFBC on Mali; nvn_vk.c img_comp)
+    VkPhysicalDeviceImageCompressionControlFeaturesEXT icc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT};
+    { const char *dg = getenv("DM_VK_DIAG");
+      if (dg && strstr(dg, "afbc") && has_ext(de, nde, "VK_EXT_image_compression_control")) {
+        VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &icc}; vk.vkGetPhysicalDeviceFeatures2(vd.pd, &q2);
+        if (icc.imageCompressionControl) { dx[ndx++] = "VK_EXT_image_compression_control"; icc.pNext = w12.pNext; w12.pNext = &icc; vd.layout2 = (PFN_vkGetImageSubresourceLayout2EXT)1; }
+      } else if (dg && strstr(dg, "afbc")) VLOG("[RED] DM_VK_DIAG=afbc: the device has no VK_EXT_image_compression_control"); }
     if (vd.surface_ext) { if (has_ext(de, nde, "VK_KHR_swapchain")) dx[ndx++] = "VK_KHR_swapchain"; else { VLOG("[RED] the device has no VK_KHR_swapchain: nothing is shown"); vd.surface_ext = NULL; } }
     // Portability subset (MoltenVK): what it lacks is invalid to use, so every feature it offers is enabled; nvn_vk.c avoids the uses whose feature is absent (samp_make, img_sview)
     vkn_portability_features pf = {VKN_STYPE_PORTABILITY_SUBSET_FEATURES, NULL};
@@ -310,6 +317,7 @@ int vkn_dev_init(void) {
 #define VKN_D(n) vk.n = (PFN_##n)vk.vkGetDeviceProcAddr(vd.dev, #n);
     VKN_DEVICE(VKN_D)
 #undef VKN_D
+    if (vd.layout2) vd.layout2 = (PFN_vkGetImageSubresourceLayout2EXT)vk.vkGetDeviceProcAddr(vd.dev, "vkGetImageSubresourceLayout2EXT");
     vk.vkGetDeviceQueue(vd.dev, vd.qfam, 0, &vd.q);
     VLOG("draw features: push descriptors %d (max %u), depth clip control %d, depthClamp %d, independentBlend %d, dualSrcBlend %d, depthBiasClamp %d, fillModeNonSolid %d, shaderImageGatherExtended %d, "
          "shaderDrawParameters %d, sampleRateShading %d; minUniformBufferOffsetAlignment %llu, maxUniformBufferRange %u", vd.push, vd.max_push, vd.clip_ctl, vd.depth_clamp, vd.indep_blend, vd.dual_src, vd.bias_clamp,

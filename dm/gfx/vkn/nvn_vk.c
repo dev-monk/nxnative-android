@@ -555,6 +555,45 @@ static VkFormat fmt_map(unsigned nf, int want, VkFormat *sf, VkImageAspectFlags 
     return 0;
 }
 // A host image for t (under vkn_tmu), with every usage its format offers (attachment, sampled, both transfers): one image per serial, whichever use made it. want as fmt_map's. why: NULL at
+// DM_VK_DIAG=afbc (diagnostics): the driver's answer (VkImageCompressionPropertiesEXT) on whether a host image is compressed, once per kind (format, usage, flags), and for the same create
+// info without STORAGE usage, without MUTABLE_FORMAT and its format list, and with STORAGE added: what each costs (on Mali: AFBC on or off). Flags 0 = compressed (default), 4 = disabled
+static uint32_t comp_of(VkImage img, VkImageAspectFlags asp) {
+    VkImageCompressionPropertiesEXT cp = {VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT};
+    VkImageSubresource2KHR sr = {VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR, NULL, {asp & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : asp & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : asp, 0, 0}};
+    VkSubresourceLayout2KHR lo = {VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_KHR, &cp};
+    vd.layout2(vd.dev, img, &sr, &lo); return cp.imageCompressionFlags;
+}
+static int comp_probe(const VkImageCreateInfo *ii, VkImageAspectFlags asp) {   // -1 = could not be made
+    VkImage im; VkDeviceMemory m = VK_NULL_HANDLE; VkMemoryRequirements mr; int r = -1;
+    if (vk.vkCreateImage(vd.dev, ii, NULL, &im)) return -1;
+    vk.vkGetImageMemoryRequirements(vd.dev, im, &mr); int mt = vkn_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)mt};
+    if (mt >= 0 && !vk.vkAllocateMemory(vd.dev, &ai, NULL, &m) && !vk.vkBindImageMemory(vd.dev, im, m, 0)) r = (int)comp_of(im, asp);
+    vk.vkDestroyImage(vd.dev, im, NULL); if (m) vk.vkFreeMemory(vd.dev, m, NULL); return r;
+}
+static void img_comp(const VkImageCreateInfo *ii, VkImage img, VkImageAspectFlags asp, uint64_t ser, VkFormatFeatureFlags ff) {
+    static struct { VkFormat f; VkImageUsageFlags u; VkImageCreateFlags c; } seen[96]; static int ns, nimg, ncomp;
+    uint32_t got = comp_of(img, asp); nimg++; ncomp += got == 0;
+    for (int i = 0; i < ns; i++) if (seen[i].f == ii->format && seen[i].u == ii->usage && seen[i].c == ii->flags) goto count;
+    if (ns == (int)(sizeof seen / sizeof *seen)) goto count;
+    seen[ns].f = ii->format; seen[ns].u = ii->usage; seen[ns].c = ii->flags; ns++;
+    { VkImageCreateInfo a = *ii; int nost = -2, nomut = -2, addst = -2;
+      if (a.usage & VK_IMAGE_USAGE_STORAGE_BIT) { a.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT; nost = comp_probe(&a, asp); a = *ii; }
+      if (a.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) { a.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; a.pNext = NULL; nomut = comp_probe(&a, asp); a = *ii; }
+      if (!(a.usage & VK_IMAGE_USAGE_STORAGE_BIT) && ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) { a.usage |= VK_IMAGE_USAGE_STORAGE_BIT; addst = comp_probe(&a, asp); }
+      NLOG("[afbc] ser=%llu %ux%u x%u levels %u format %d usage %#x flags %#x%s: compression %#x; without STORAGE %d, without MUTABLE_FORMAT %d, with STORAGE added %d (-2: n/a, -1: not made)",
+           (unsigned long long)ser, ii->extent.width, ii->extent.height, ii->arrayLayers, ii->mipLevels, ii->format, ii->usage, ii->flags, ii->pNext ? " +format list" : "", got, nost, nomut, addst); }
+count:
+    if (!(nimg & 255)) NLOG("[afbc] %d host images so far, %d compressed", nimg, ncomp);
+}
+// DM_VK_STORAGE_SER=<ser>[,<ser>…] (an experiment): only those images get STORAGE usage (the ones the dispatches write, logged as "writes ser=… as a storage image"); every other colour
+// image keeps its compression (AFBC on Mali: STORAGE usage turns it off). A dispatch writing an image not in the list is skipped (said in red)
+static int storage_ser(uint64_t ser) {
+    static const char *l = (const char *)1; if (l == (const char *)1) l = getenv("DM_VK_STORAGE_SER");
+    if (!l || !*l) return 1;
+    for (const char *p = l; *p; ) { char *e; unsigned long long v = strtoull(p, &e, 10); if (e == p) break; if (v == ser) return 1; p = *e == ',' ? e + 1 : e; }
+    return 0;
+}
 // TextureInitialize (a texture this slice cannot render to is passed over quietly: not every texture in such a pool is a target), else the use that wants it (said in red when it cannot have one)
 static vkn_img *img_make(const tex_t *t, const char *why, int want) {
     VkFormat sf = 0, f = 0; VkImageAspectFlags asp = 0; const char *no = NULL; int tg = t->d.target;
@@ -580,7 +619,7 @@ static vkn_img *img_make(const tex_t *t, const char *why, int want) {
     VkImageUsageFlags u = (!is3d && ff & (col ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ? (col ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) : 0)
                         | (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) | (ff & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)
                         | (ff & VK_FORMAT_FEATURE_TRANSFER_DST_BIT ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0)
-                        | (col && sf == f && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !(getenv("DM_VK_STORAGE_IMG") && *getenv("DM_VK_STORAGE_IMG") == '0') ? VK_IMAGE_USAGE_STORAGE_BIT : 0);   // compute shaders write it as an image (op_dispatch); not with a second view format (its views would inherit the usage), DM_VK_STORAGE_IMG=0: never
+                        | (col && sf == f && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !(getenv("DM_VK_STORAGE_IMG") && *getenv("DM_VK_STORAGE_IMG") == '0') && storage_ser(t->serial) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);   // compute shaders write it as an image (op_dispatch); not with a second view format (its views would inherit the usage), DM_VK_STORAGE_IMG=0: never
     VkFormat fl[2] = {f, sf}; VkImageFormatListCreateInfo li = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, fl};   // the two formats it is viewed as (a driver may keep its compression)
     int cubec = cube_on && !is3d && w == h && layers >= 6 && layers % 6 == 0;   // square with whole sets of six layers: a game may view it as a cube (TTYD's lighting probes)
     VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, sf != f ? &li : NULL, (sf != f ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) | (cubec ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0), is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, f, {w, h, dz}, lv, layers, VK_SAMPLE_COUNT_1_BIT,
@@ -594,6 +633,7 @@ static vkn_img *img_make(const tex_t *t, const char *why, int want) {
     if (mt < 0 || vk.vkAllocateMemory(vd.dev, &ai, NULL, &e->mem) || vk.vkBindImageMemory(vd.dev, e->img, e->mem, 0)) {
         NRED_ONCE("device memory for a %ux%u host image (%llu B) failed: texture ser=%llu has none", w, h, (unsigned long long)mr.size, (unsigned long long)t->serial);
         if (e->mem) vk.vkFreeMemory(vd.dev, e->mem, NULL); vk.vkDestroyImage(vd.dev, e->img, NULL); free(e); return NULL; }
+    if (vd.layout2) img_comp(&ii, e->img, asp, t->serial, ff);
     e->serial = t->serial; e->fmt = f; e->sfmt = sf; e->aspect = asp; e->w = w; e->h = h; e->depth = dz; e->cube = cubec; e->layers = layers; e->levels = lv; e->nvn_fmt = (uint32_t)t->d.format;
     e->usage = u; e->gpu = want == NVK_RT; e->gmem = t->mem; e->size = t->L.size; e->d = t->d;
     e->layout = e->rec = VK_IMAGE_LAYOUT_UNDEFINED; g_img_b += mr.size;
@@ -2223,7 +2263,8 @@ static VkPipeline pso_make(const pso_key *k, const vkn_shader *vs, const vkn_sha
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo, k->restart};
     VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
     VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->clip11 ? &dcc : NULL, 0, 1, NULL, 1, NULL};
-    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->dclamp, VK_FALSE, (VkPolygonMode)k->pmode, k->cull, (VkFrontFace)k->front, k->bias, 0, 0, 0, 1.0f};
+    static int rdis = -1; if (rdis < 0) { const char *x = getenv("DM_VK_DIAG"); rdis = x && strstr(x, "rdiscard"); }   // DM_VK_DIAG=rdiscard (wrong on purpose, a bound): no draw rasterizes (vertex shading and per-pass cost only)
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->dclamp, rdis ? VK_TRUE : VK_FALSE, (VkPolygonMode)k->pmode, k->cull, (VkFrontFace)k->front, k->bias, 0, 0, 0, 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, NULL, k->a2c, VK_FALSE};
     VkStencilOpState sf = {(VkStencilOp)k->sfail[0], (VkStencilOp)k->szpass[0], (VkStencilOp)k->szfail[0], (VkCompareOp)k->scmp[0], 0, 0, 0},
                      sb = {(VkStencilOp)k->sfail[1], (VkStencilOp)k->szpass[1], (VkStencilOp)k->szfail[1], (VkCompareOp)k->scmp[1], 0, 0, 0};
@@ -2589,6 +2630,8 @@ static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescripto
             if (e && (e->usage & VK_IMAGE_USAGE_STORAGE_BIT) && nofmt_write_ok(e->fmt) && lv < e->levels && ly < e->layers) { use_mark(e); v = vkn_img_view(e, lv, ly, 0); }
             pthread_mutex_unlock(&vkn_tmu);
             if (!v) { NRED_ONCE("compute shader %s: image slot %u (texture ID %d, ser=%llu) has no host image this device can write as storage: the dispatch is skipped", sh->key, b->reg, tid, (unsigned long long)ser); return 0; }
+            { static uint64_t seen[32]; static int ns; int k = 0; while (k < ns && seen[k] != ser) k++;   // which images the dispatches write (DM_VK_STORAGE_SER takes this list)
+              if (k == ns && ns < 32) { seen[ns++] = ser; NLOG("compute shader %s writes ser=%llu (%ux%u format %d) as a storage image", sh->key, (unsigned long long)ser, e->w, e->h, e->fmt); } }
             imgs[(*ni)++] = e;
             ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL}; wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[i].pImageInfo = &ii[i];
         } else if (b->kind == VKN_B_TEXD || b->kind == VKN_B_SAMPD || b->kind == VKN_B_TEXU) {

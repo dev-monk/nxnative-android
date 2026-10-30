@@ -67,6 +67,7 @@ typedef struct {
     uint32_t sg_ops, sg_stages, sg_size;   // VkPhysicalDeviceSubgroupProperties (vk_shader.c cap_ok takes the GroupNonUniform* capabilities it reports; DM_VK_SUBGROUP=0: none)
     int bc_native;                       // textureCompressionBC is on (else BC textures are decoded on the CPU: vk_bc.c)
     int nofmt_w, nofmt_r;                // shaderStorageImageWriteWithoutFormat / ReadWithoutFormat are on (DM_VK_NOFMT=0: off)
+    PFN_vkGetImageSubresourceLayout2EXT layout2;   // DM_VK_DIAG=afbc: VK_EXT_image_compression_control is on (nvn_vk.c img_comp logs whether host images are compressed)
 } vkn_dev_t;
 extern vkn_dev_t vd;
 int vkn_dev_init(void);                  // 1 = a device; logs the driver's identity

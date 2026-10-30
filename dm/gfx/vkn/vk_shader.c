@@ -642,6 +642,7 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
             if (bits && (stage == 1 || stage == 5)) { int nb2 = 0; uint32_t *p = spv_bits(spv, nbytes / 4, sh, &mn, &nb2); if (p) { ms = p; sh->bits = nb2; static int nl; if (nl++ < 4) VLOG("shader %s: %d texture reads used only as bits read a uint image (a stencil view: first cases)", hk, nb2); } else mn = nbytes / 4; }
             if (idm && sh->dyn && (stage == 1 || stage == 5)) { size_t in = mn; uint32_t *p = spv_idmap(ms, in, sh, &mn, &nfix); if (p) { if (ms != spv) free(ms); ms = p; sh->idmap = nfix; } else mn = in; }
             { const char *dd = getenv("DM_VK_IDMAP_DUMP"); if (dd && *dd && ms != spv) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_IDMAP_DUMP=<dir>: the rewritten modules, for spirv-val
+            { const char *dd = getenv("DM_VK_SPV_DUMP"); if (dd && *dd) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_SPV_DUMP=<dir>: every module as handed to the driver, after all patches (malioc)
             VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, mn * 4, ms};
             VkResult r = vk.vkCreateShaderModule(vd.dev, &ci, NULL, &sh->mod);
             if (r) snprintf(why, sizeof why, "vkCreateShaderModule: %d", r);
