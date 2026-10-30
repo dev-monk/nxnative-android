@@ -1265,10 +1265,17 @@ static int tex_init_ok(const vkn_img *e, const tex_t *t) {
 // want / comp: the view type and component type the shader declares (-1: a draw with no program, the view's own type); why: what an empty answer means when the texture exists
 // (1 a target of the pass, 2 a cube the shader wants and no host image is one, 3 a component type the image's format has not)
 enum { TL_FEED = 1, TL_CUBE, TL_COMP, TL_3D };
-static char g_tl_what[128];   // what the last tex_lookup found (the red lines of draw_view say it)
+// What the last tex_lookup found (the red lines of draw_view say it): its fields kept, formatted by tl_what only when a line is written (a snprintf at every lookup
+// was 3.5% of TTYD's game thread on the Mac)
+static struct { int ok; unsigned long long ser; uint32_t w, h, nvn_fmt; int fmt, aspect, vc; } g_tlw;
+static const char *tl_what(void) {
+    static char b[128]; b[0] = 0;
+    if (g_tlw.ok) snprintf(b, sizeof b, "ser=%llu %ux%u NVN format %#x, Vulkan %d, aspect %#x, view class %d", g_tlw.ser, g_tlw.w, g_tlw.h, g_tlw.nvn_fmt, g_tlw.fmt, g_tlw.aspect, g_tlw.vc);
+    return b;
+}
 static VkImageView tex_lookup(int tid, int want, int comp, int *why, int st) {
     if (why) *why = 0;
-    g_tl_what[0] = 0;
+    g_tlw.ok = 0;
     if (!tid) return VK_NULL_HANDLE;
     TSA(TS_TLOOK, 1);
     pthread_mutex_lock(&g_rmu);
@@ -1292,8 +1299,7 @@ static VkImageView tex_lookup(int tid, int want, int comp, int *why, int st) {
     if (e && want == VKN_VT_CUBE && !e->cube) { if (why) *why = TL_CUBE; e = NULL; }   // the shader wants a cube, the image cannot be viewed as one
     if (e && want == VKN_VT_3D && e->depth <= 1 && r.t.d.target != NVN_TEXTURE_TARGET_3D) { if (why) *why = TL_3D; e = NULL; }   // the shader wants 3D, the texture is not
     int vc = 0;
-    if (e) { use_mark(e); v = tex_view(e, &r, tid, want, &vc); snprintf(g_tl_what, sizeof g_tl_what, "ser=%llu %ux%u NVN format %#x, Vulkan %d, aspect %#x, view class %d",
-                                                                     (unsigned long long)e->serial, e->w, e->h, e->nvn_fmt, e->fmt, e->aspect, vc); }
+    if (e) { use_mark(e); v = tex_view(e, &r, tid, want, &vc); g_tlw.ok = 1; g_tlw.ser = (unsigned long long)e->serial; g_tlw.w = e->w; g_tlw.h = e->h; g_tlw.nvn_fmt = e->nvn_fmt; g_tlw.fmt = e->fmt; g_tlw.aspect = e->aspect; g_tlw.vc = vc; }
     // A stencil view the shader declares as floats: the translator has no integer texture type and the shader takes the raw bits, as nvn_mtl.m binds Metal's stencil-only view.
     // Paper Mario: The Thousand-Year Door's reflection pass (reflection.bfsha) reads its mask so. A uint view bound to a float image is undefined in Vulkan: on the RG 476H (Mali-G57) it
     // greyed Rogueport's walkway (screen luminance 158 -> 137) and drew no reflection, for ~2 ms a frame. Opt-in, DM_VK_STENCIL_RAW=1; by default such a slot reads zeros, as before
@@ -2210,7 +2216,7 @@ static void draw_dyn(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {
         if (b->kind == VKN_B_TEXD) {
             uint64_t h = k < 128 ? (T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; int tid = (int)(h & 0xfffff), why = 0;
             VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
-            if (!v && why) { static int n; if (n++ < 12) NLOG("dynamic array element %d (stage %d, view type %d, class %d): texture ID %d reads the dummy, reason %d (%s) (first cases)", k, st, b->vt, b->comp, tid, why, g_tl_what); }
+            if (!v && why) { static int n; if (n++ < 12) NLOG("dynamic array element %d (stage %d, view type %d, class %d): texture ID %d reads the dummy, reason %d (%s) (first cases)", k, st, b->vt, b->comp, tid, why, tl_what()); }
             if (!v) v = g_dview[b->comp][b->vt];
             out[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, SR_LAYOUT};
         } else {
@@ -2295,8 +2301,8 @@ static VkImageView draw_view(int st, const vkn_shader *sh, const vkn_sbind *b) {
     int tid = (int)((ih ? ih : T.tex[st][s]) & 0xfffff), why = 0;
     if (ih) { static int n; if (n++ < 4) NLOG("shader %s: texture slot %d reads image slot %d's texture ID %d (first cases)", sh->key, s, s - 32, tid); }
     VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
-    if (why == TL_FEED) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d, %s), a target of the pass it draws in: the slot reads zeros (a copy is a later slice)", sh->key, tid, st, s, g_tl_what);
-    else if (why == TL_COMP) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d, %s) as %s, its format is not: the slot reads zeros", sh->key, tid, st, s, g_tl_what, b->comp == 1 ? "unsigned integers" : b->comp == 2 ? "signed integers" : "floats");
+    if (why == TL_FEED) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d, %s), a target of the pass it draws in: the slot reads zeros (a copy is a later slice)", sh->key, tid, st, s, tl_what());
+    else if (why == TL_COMP) NRED_ONCE("shader %s samples texture ID %d (stage %d slot %d, %s) as %s, its format is not: the slot reads zeros", sh->key, tid, st, s, tl_what(), b->comp == 1 ? "unsigned integers" : b->comp == 2 ? "signed integers" : "floats");
     else if (why == TL_CUBE) { static int n; if (n++ < 8) NLOG("shader %s samples stage %d slot %d as a cube, and texture ID %d is not one this slice has (cube textures are a later slice): the slot reads zeros", sh->key, st, s, tid); }
     else if (why == TL_3D) { static int n; if (n++ < 8) NLOG("shader %s samples stage %d slot %d as a 3D texture (texture ID %d): 3D textures are a later slice, the slot reads zeros", sh->key, st, s, tid); }
     T.tv[st][s] = v;
