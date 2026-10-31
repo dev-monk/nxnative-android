@@ -364,13 +364,14 @@ static int c1_make(vkn_shader *sh, const char *hex, char *why, size_t wn) {
 // A tex_dyn_slots array indexed by a handle the shader read from memory (Paper Mario: The Thousand-Year Door's material table, storage buffer s0, names the S block's reflection
 // cube by its own handle, texture ID 393): the translation's index is min(id, 31), so any ID past 31 read element 31. Each such clamp (UMin(x, 31) stored to a local, loaded,
 // bitcast, then the array's access chain index) becomes: x below 32 as before (c2's slot indices, draw_drv2), else the slot k whose bound handle has that ID (texture part
-// for a texture array, sampler part for a sampler array), from a 32-word push constant table (nvn_vk.c draw_idmap: slot k's handle, as element k holds it), else 31.
+// for a texture array, sampler part for a sampler array), from a 32-word push constant table (nvn_vk.c draw_idmap: slot k's handle, as element k holds it), else 31. An ID no
+// slot holds is found when the host can read the handle itself (spv_hsrc, nvn_vk.c idmap_extra puts it in an element).
 // Returns the new module (malloc) and its size, or NULL: nothing to change. DM_VK_IDMAP=0: not done
 // A float-declared 2D texture whose reads are used only as bits (each read's components, directly or through a local, go only into OpBitcast to int / uint): the Switch returns an
 // integer texture's bits through a float sampler, and Paper Mario: The Thousand-Year Door's reflection masks and lighting read the depth-stencil's stencil view so (floatBitsToInt(x) & 1);
 // Vulkan has no float read of a stencil view (it read zeros: no reflection). The binding becomes a uint image (comp 1, so the host binds the stencil view), each read returns uvec4
 // under a new id, and an OpBitcast to the old type takes the old id: every use is unchanged. Returns the new module (malloc), or NULL: nothing to change. DM_VK_BITS=0: not done
-static int g_ida[4], g_bits_n;   // spv_idmap: modules rewritten, texture clamps, sampler clamps, clamps left as selects (a loop header or continue target); spv_bits: modules rewritten
+static int g_ida[4], g_bits_n, g_hs[2];   // spv_idmap: modules rewritten, texture clamps, sampler clamps, clamps left as selects (a loop header or continue target); spv_bits: modules rewritten; spv_hsrc: modules with handle words the host reads, words
 static int spv_is_int(const uint32_t *w, size_t nw, uint32_t t) {   // t is a 32-bit int type
     for (size_t i = 5; i < nw; ) { uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (op == 54) break; if (op == 21 && w[i + 1] == t && w[i + 2] == 32) return 1; i += wc; }
     return 0;
@@ -595,6 +596,81 @@ static uint32_t *spv_idmap(const uint32_t *w, size_t nw, const vkn_shader *sh, s
     o[3] = bound; *onw = n; *nfix = nf;
     return o;
 }
+// The handles behind spv_idmap's clamps that the host can read itself: from each UMin(x, 31), x is followed back (through locals, bitcasts, masks, shifts, selects and phis) to the
+// storage-buffer words it is loaded from; a load whose word index is made only of constants and uniform-buffer words (through single-store locals, bitcasts and integer add, sub, mul,
+// shifts, and, or) becomes a postfix program in sh->hs. Per draw, nvn_vk.c idmap_extra reads that word from guest memory, and a handle no bound slot holds gets a free array element.
+// Paper Mario: The Thousand-Year Door's S block: its material's reflection cube is word (c6[1].w << 7) + 240 bytes of s0, a cube the room after Rogueport does not bind
+static void spv_hsrc(const uint32_t *w, size_t nw, vkn_shader *sh) {
+    uint32_t bound = w[3], glsl = 0, tu = 0, c31[8]; int nc = 0;
+    uint32_t *def = calloc(bound, 4), *bnd = calloc(bound, 4); if (!def || !bnd) { free(def); free(bnd); return; }
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (!wc) break;
+        if (op == 11 && wc >= 3 && !strcmp((const char *)(const void *)&w[i + 2], "GLSL.std.450")) glsl = w[i + 1];
+        if (op == 21 && wc == 4 && w[i + 2] == 32 && !w[i + 3]) tu = w[i + 1];
+        if (op == 43 && wc == 4 && tu && w[i + 1] == tu && w[i + 3] == 31 && nc < 8) c31[nc++] = w[i + 2];
+        if (op == 71 && wc >= 4 && w[i + 2] == 33 && w[i + 1] < bound) bnd[w[i + 1]] = w[i + 3] + 1;   // Binding (+1: 0 = none)
+        if ((op == 43 || op == 59 || op == 61 || op == 65 || op == 83 || op == 124 || op == 128 || op == 130 || op == 132 || (op >= 194 && op <= 197) || op == 199 || op == 169 || op == 245 || op == 12)
+            && wc >= 3 && w[i + 2] < bound) def[w[i + 2]] = (uint32_t)i;
+        i += wc;
+    }
+    // a variable's binding of the kind asked: its slot (reg), else -1
+#define HS_REG(var, kd) ({ int _r = -1; uint32_t _b = (var) < bound ? bnd[var] : 0; for (int _q = 0; _b && _q < sh->nb; _q++) if (sh->b[_q].binding + 1u == _b && sh->b[_q].kind == (kd)) _r = sh->b[_q].reg; _r; })
+#define HS_CONST0(id) ((id) < bound && def[id] && (w[def[id]] & 0xffff) == 43 && !w[def[id] + 3])
+    for (size_t m = 5; m < nw && glsl && nc; ) {
+        uint32_t op = w[m] & 0xffff, wc = w[m] >> 16; if (!wc) break;
+        int is31 = 0; if (op == 12 && wc == 7 && w[m + 3] == glsl && w[m + 4] == 38) for (int q = 0; q < nc; q++) is31 |= w[m + 6] == c31[q];
+        if (is31) {
+            uint32_t st[64], seen[128]; int ns = 0, nseen = 0; st[ns++] = w[m + 5];
+            while (ns) {
+                uint32_t id = st[--ns]; int dup = 0; for (int q = 0; q < nseen; q++) dup |= seen[q] == id;
+                if (dup || id >= bound || !def[id] || nseen >= 128) continue;
+                seen[nseen++] = id; size_t d = def[id]; uint32_t o2 = w[d] & 0xffff, c2 = w[d] >> 16;
+#define PUSH(x) do { if (ns < 64) st[ns++] = (x); } while (0)
+                if (o2 == 61) { uint32_t pv = w[d + 3], dp = pv < bound ? def[pv] : 0; if (!dp) continue;
+                    if ((w[dp] & 0xffff) == 59 && w[dp + 3] == 7) { for (size_t j = 5; j < nw; ) { uint32_t o3 = w[j] & 0xffff, c3 = w[j] >> 16; if (!c3) break; if (o3 == 62 && w[j + 1] == pv) PUSH(w[j + 2]); j += c3; } }
+                    else if ((w[dp] & 0xffff) == 65 && (w[dp] >> 16) == 6 && HS_CONST0(w[dp + 4])) {   // storage word: base, 0, index
+                        int reg = HS_REG(w[dp + 3], VKN_B_SBUF); if (reg < 0 || sh->nhs >= 4) continue;
+                        // its index as postfix
+                        uint32_t c[32]; int n = 0, ok = 1, depth = 0; uint32_t es[24]; int ne = 0, pend[24]; es[ne] = w[dp + 5]; pend[ne++] = 0;
+                        // iterative post-order: pend 0 = to expand, 1 = operands emitted (emit the op)
+                        while (ne && ok) {
+                            uint32_t e = es[ne - 1]; size_t de = e < bound ? def[e] : 0; uint32_t oe = de ? w[de] & 0xffff : 0;
+                            if (++depth > 256) { ok = 0; break; }
+                            int bin = oe == 128 ? VKN_HS_ADD : oe == 130 ? VKN_HS_SUB : oe == 132 ? VKN_HS_MUL : oe == 196 ? VKN_HS_SHL : oe == 194 ? VKN_HS_SHR : oe == 195 ? VKN_HS_SAR : oe == 199 ? VKN_HS_AND : oe == 197 ? VKN_HS_OR : 0;
+                            if (pend[ne - 1]) { ne--; if (n + 2 > 32) ok = 0; else { c[n++] = (uint32_t)bin; c[n++] = 0; } continue; }
+                            if (!de) { ok = 0; break; }
+                            if (oe == 43) { ne--; if (n + 2 > 32) ok = 0; else { c[n++] = VKN_HS_CONST; c[n++] = w[de + 3]; } }
+                            else if (oe == 124 || oe == 83) es[ne - 1] = w[de + 3];
+                            else if (bin) { if (ne + 2 > 24) { ok = 0; break; } pend[ne - 1] = 1; es[ne] = w[de + 4]; pend[ne++] = 0; es[ne] = w[de + 3]; pend[ne++] = 0; }
+                            else if (oe == 61) { uint32_t pv2 = w[de + 3], dq = pv2 < bound ? def[pv2] : 0; if (!dq) { ok = 0; break; }
+                                if ((w[dq] & 0xffff) == 59 && w[dq + 3] == 7) {   // a local stored once
+                                    uint32_t val = 0; int nsv = 0; for (size_t j = 5; j < nw; ) { uint32_t o3 = w[j] & 0xffff, c3 = w[j] >> 16; if (!c3) break; if (o3 == 62 && w[j + 1] == pv2) { val = w[j + 2]; nsv++; } j += c3; }
+                                    if (nsv != 1) ok = 0; else es[ne - 1] = val; }
+                                else if ((w[dq] & 0xffff) == 65 && (w[dq] >> 16) == 7 && HS_CONST0(w[dq + 4])) {   // uniform word: base, 0, vec4 index, component (constants)
+                                    int ur = HS_REG(w[dq + 3], VKN_B_UBO); uint32_t a = w[dq + 5], b = w[dq + 6];
+                                    int ka = a < bound && def[a] && (w[def[a]] & 0xffff) == 43, kb = b < bound && def[b] && (w[def[b]] & 0xffff) == 43;
+                                    uint32_t off = ka && kb ? 16 * w[def[a] + 3] + 4 * w[def[b] + 3] : 0x10000;
+                                    if (ur < 0 || off > 0xfffc || n + 2 > 32) ok = 0; else { ne--; c[n++] = VKN_HS_UBO; c[n++] = (uint32_t)ur << 16 | off; } }
+                                else ok = 0; }
+                            else ok = 0;
+                        }
+                        if (ok && !ne && n) { int same = 0; for (int q = 0; q < sh->nhs; q++) same |= sh->hs[q].reg == reg && sh->hs[q].n == n && !memcmp(sh->hs[q].c, c, 4 * (size_t)n);
+                            if (!same) { sh->hs[sh->nhs].reg = (uint16_t)reg; sh->hs[sh->nhs].n = (uint16_t)n; memcpy(sh->hs[sh->nhs].c, c, 4 * (size_t)n); sh->nhs++; } }
+                    } }
+                else if (o2 == 124 || o2 == 83) PUSH(w[d + 3]);
+                else if (o2 == 199 || o2 == 194 || o2 == 195 || o2 == 197) { PUSH(w[d + 3]); PUSH(w[d + 4]); }
+                else if (o2 == 169) { PUSH(w[d + 4]); PUSH(w[d + 5]); }
+                else if (o2 == 245) for (uint32_t a = 3; a < c2; a += 2) PUSH(w[d + a]);
+#undef PUSH
+            }
+        }
+        m += wc;
+    }
+#undef HS_REG
+#undef HS_CONST0
+    if (sh->nhs) { g_hs[0]++; g_hs[1] += sh->nhs; }
+    free(def); free(bnd);
+}
 static uint32_t g_shid;
 // The SPIR-V's SHA-256 against the reflection's spv_sha256: its first 8 bytes, 16 lowercase hex digits (dmsh_build_vk.py: of the decompressed module)
 // A compute shader as a fragment shader (nvn_vk.c csf_run runs its dispatch as one triangle over its storage images as colour attachments: an image a dispatch writes needs storage usage,
@@ -818,7 +894,9 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
             size_t mn = nbytes / 4; uint32_t *ms = spv; int nfix = 0;
             static int bits = -1; if (bits < 0) { const char *x = getenv("DM_VK_BITS"); bits = !(x && *x == '0'); }
             if (bits && (stage == 1 || stage == 5)) { int nb2 = 0; uint32_t *p = spv_bits(spv, nbytes / 4, sh, &mn, &nb2); if (p) { ms = p; sh->bits = nb2; static int nl; if (nl++ < 4) VLOG("shader %s: %d texture reads used only as bits read a uint image (a stencil view: first cases)", hk, nb2); } else mn = nbytes / 4; }
-            if (idm && sh->dyn && (stage == 1 || stage == 5)) { size_t in = mn; uint32_t *p = spv_idmap(ms, in, sh, &mn, &nfix); if (p) { if (ms != spv) free(ms); ms = p; sh->idmap = nfix; } else mn = in; }
+            if (idm && sh->dyn && (stage == 1 || stage == 5)) { size_t in = mn; uint32_t *p = spv_idmap(ms, in, sh, &mn, &nfix); if (p) { static int hs = -1; if (hs < 0) { const char *x = getenv("DM_VK_IDMAP_MEM"); hs = !(x && *x == '0'); }
+                if (hs) spv_hsrc(ms, in, sh);   // before ms is replaced: the clamps as they were. DM_VK_IDMAP_MEM=0: not done
+                if (ms != spv) free(ms); ms = p; sh->idmap = nfix; } else mn = in; }
             { const char *dd = getenv("DM_VK_IDMAP_DUMP"); if (dd && *dd && ms != spv) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_IDMAP_DUMP=<dir>: the rewritten modules, for spirv-val
             { const char *dd = getenv("DM_VK_SPV_DUMP"); if (dd && *dd) { char fp[1024]; snprintf(fp, sizeof fp, "%s/%s.spv", dd, hk); FILE *f = fopen(fp, "wb"); if (f) { fwrite(ms, 4, mn, f); fclose(f); } } }   // DM_VK_SPV_DUMP=<dir>: every module as handed to the driver, after all patches (malioc)
             for (size_t i = 5; stage == 5 && i < mn && ms[i] >> 16; i += ms[i] >> 16)   // the local size (OpExecutionMode, LocalSize)
@@ -839,6 +917,7 @@ static vkn_shader *mod_make(const uint8_t key[8], int stage, const char *json, u
                 else { sh->fbad = 1; VLOG("compute shader %s: dispatched (not as a pass: %s)", hk, fw); }
             }
             if (sh->idmap) { static int nl; if (nl++ < 4) VLOG("shader %s: %d array index clamps look up the bound slots' handles (a handle read from memory; first cases)", hk, nfix); }
+            if (sh->nhs) { static int nl; if (nl++ < 4) VLOG("shader %s: %d handle words the host reads per draw (storage slot %d, %d postfix words; first cases)", hk, sh->nhs, sh->hs[0].reg, sh->hs[0].n / 2); }
             if (ms != spv) free(ms);
         }
     }
@@ -882,7 +961,7 @@ static void idmap_all(void) {
         vkn_shader_get(k, st); n++;
     }
     if (d) closedir(d);
-    VLOG("DM_VK_IDMAP_ALL: %d pixel and compute shaders with tex_dyn_slots arrays or float textures loaded (bit reads rewritten in %d): %d rewritten, %d texture and %d sampler clamps, %d of them as selects", n, g_bits_n, g_ida[0], g_ida[1], g_ida[2], g_ida[3]);
+    VLOG("DM_VK_IDMAP_ALL: %d pixel and compute shaders with tex_dyn_slots arrays or float textures loaded (bit reads rewritten in %d): %d rewritten, %d texture and %d sampler clamps, %d of them as selects; %d with %d handle words the host reads per draw", n, g_bits_n, g_ida[0], g_ida[1], g_ida[2], g_ida[3], g_hs[0], g_hs[1]);
 }
 // The tests' modules (t_vkn.c): a map entry and a module from memory, as if read from the directory
 vkn_shader *vkn_shader_add(const uint8_t key[8], int stage, const char *json, const uint32_t *spv, size_t nbytes) {

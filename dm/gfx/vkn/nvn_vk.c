@@ -2466,19 +2466,22 @@ static int draw_drv2(int st, const vkn_shader *sh, VkDescriptorBufferInfo *o) {
     *o = (VkDescriptorBufferInfo){buf, off, DRV2_B};
     return 1;
 }
+static uint32_t g_xt[6][32], g_xs[6][32];   // by stage: element k of the draw's or dispatch's TEXD / SAMPD arrays holds this texture / sampler ID read from memory, 0 = what slot k holds (idmap_extra)
 // A dynamic handle array's elements (TEXD: element k = the texture of combined slot k, else separate slot k, as the array's view type; one of another kind or none: the dummy;
-// SAMPD: the separate sampler of slot k, else the sampler half of combined slot k). out: b->n entries
+// SAMPD: the separate sampler of slot k, else the sampler half of combined slot k; either: an ID idmap_extra put there). out: b->n entries
 static void draw_dyn(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {
     g_tl_from = "draw_dyn";
     for (int k = 0; k < b->n; k++) {
         if (b->kind == VKN_B_TEXD) {
-            uint64_t h = k < 128 ? (T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; int tid = (int)(h & 0xfffff), why = 0;
-            VkImageView v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
+            int why = 0; VkImageView v = k < 32 && g_xt[st][k] ? tex_lookup((int)g_xt[st][k], b->vt, b->comp, &why, st) : VK_NULL_HANDLE;   // a texture read from memory put here (idmap_extra), when it is of this array's kind
+            if (v) { out[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, SR_LAYOUT}; continue; }
+            uint64_t h = k < 128 ? (T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; int tid = (int)(h & 0xfffff); why = 0;
+            v = tid ? tex_lookup(tid, b->vt, b->comp, &why, st) : VK_NULL_HANDLE;
             if (!v && why) { static int n; if (n++ < 12) NLOG("dynamic array element %d (stage %d, view type %d, class %d): texture ID %d reads the dummy, reason %d (%s) (first cases)", k, st, b->vt, b->comp, tid, why, tl_what()); }
             if (!v) v = g_dview[b->comp][b->vt];
             out[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, SR_LAYOUT};
         } else {
-            int sid = k < 128 ? (int)(T.samp[st][k] >> 20) : 0;
+            int sid = k < 32 && g_xs[st][k] ? (int)g_xs[st][k] : k < 128 ? (int)(T.samp[st][k] >> 20) : 0;
             if (!sid && k < 256) sid = (int)(T.tex[st][k] >> 20);
             VkSampler sm = sid ? samp_lookup(sid) : VK_NULL_HANDLE;
             out[k] = (VkDescriptorImageInfo){sm ? sm : g_dsamp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
@@ -2487,14 +2490,50 @@ static void draw_dyn(int st, const vkn_sbind *b, VkDescriptorImageInfo *out) {
 }
 // The 32-word push constant table of a shader whose array indices look up handles read from memory (vk_shader.c spv_idmap): word k is what element k of its TEXD / SAMPD arrays
 // holds (draw_dyn), slot k's texture ID | its sampler ID << 20
+static uint32_t idm_word(int st, int k) {   // slot k's word of that table: its texture ID | its sampler ID << 20
+    uint64_t h = T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k];
+    uint32_t sid = (uint32_t)(T.samp[st][k] >> 20); if (!sid) sid = (uint32_t)(T.tex[st][k] >> 20);
+    return (uint32_t)(h & 0xfffff) | sid << 20;
+}
 static void draw_idmap(VkCommandBuffer cb, VkPipelineLayout pl, VkShaderStageFlags sf, int st) {
     uint32_t t[32];
-    for (int k = 0; k < 32; k++) {
-        uint64_t h = T.tex[st][k] ? T.tex[st][k] : T.tex[st][NVN_SEPTEX_SLOT0 + k];
-        uint32_t sid = (uint32_t)(T.samp[st][k] >> 20); if (!sid) sid = (uint32_t)(T.tex[st][k] >> 20);
-        t[k] = (uint32_t)(h & 0xfffff) | sid << 20;
-    }
+    for (int k = 0; k < 32; k++) { uint32_t w = idm_word(st, k); t[k] = (g_xt[st][k] ? g_xt[st][k] : w & 0xfffff) | (g_xs[st][k] ? g_xs[st][k] : w >> 20) << 20; }
     vk.vkCmdPushConstants(cb, pl, sf, 0, sizeof t, t);
+}
+// The handles a shader reads from memory at an address the host can work out (vkn_shader.hs, vk_shader.c spv_hsrc), read from guest memory now (inline uniform updates replayed so
+// far are there). A texture (or sampler) ID no slot holds is put in the highest element whose own is free or also held by a lower slot (the search takes the lowest match, so that
+// element was never found by it), and draw_idmap's table says so; an array whose view type the texture is not keeps the slot's own there (draw_dyn), and only a slot named by c2 reads
+// it directly. Paper Mario: The Thousand-Year Door: the S block's material names Rogueport's reflection cubes (texture IDs 392 / 393) in every room, and only Rogueport binds them:
+// elsewhere the face read element 31 (no cube: black, no colours). Before the descriptors are written. DM_VK_IDMAP_MEM=0: none (vk_shader.c)
+static uint32_t ubo_handle(int st, int reg, uint32_t off);
+static void idmap_extra(int st, const vkn_shader *sh) {
+    memset(g_xt[st], 0, sizeof g_xt[st]); memset(g_xs[st], 0, sizeof g_xs[st]);
+    for (int i = 0; sh && i < sh->nhs; i++) {
+        uint32_t v[16]; int n = 0, ok = 1;
+        for (int j = 0; j + 1 < sh->hs[i].n && ok; j += 2) { uint32_t op = sh->hs[i].c[j], a = sh->hs[i].c[j + 1];
+            if (op == VKN_HS_CONST || op == VKN_HS_UBO) { if (n >= 16) ok = 0; else v[n++] = op == VKN_HS_CONST ? a : ubo_handle(st, (int)(a >> 16), a & 0xffff); continue; }
+            if (n < 2) { ok = 0; break; }
+            uint32_t y = v[--n], x = v[n - 1];
+            v[n - 1] = op == VKN_HS_ADD ? x + y : op == VKN_HS_SUB ? x - y : op == VKN_HS_MUL ? x * y : op == VKN_HS_SHL ? x << (y & 31) : op == VKN_HS_SHR ? x >> (y & 31)
+                     : op == VKN_HS_SAR ? (uint32_t)((int32_t)x >> (y & 31)) : op == VKN_HS_AND ? x & y : x | y; }
+        const p_bind_buf *sb = &S.ssbo[st][sh->hs[i].reg]; uint32_t h = 0;
+        if (!ok || n != 1 || !sb->addr || (uint64_t)v[0] * 4 + 4 > sb->size) continue;
+        memcpy(&h, (const void *)(uintptr_t)(sb->addr + (uint64_t)v[0] * 4), 4);
+        uint32_t id[2] = {h & 0xfffff, h >> 20};   // texture, sampler
+        for (int part = 0; part < 2; part++) {
+            uint32_t x = id[part], (*g)[32] = part ? g_xs : g_xt; if (!x) continue;
+            int held = 0, fr = -1;
+            for (int k = 0; k < 32; k++) { uint32_t w = idm_word(st, k); held |= (g[st][k] ? g[st][k] : part ? w >> 20 : w & 0xfffff) == x; }
+            if (held) continue;
+            for (int k = 31; k >= 0 && fr < 0; k--) { if (g[st][k]) continue;
+                uint32_t own = part ? idm_word(st, k) >> 20 : idm_word(st, k) & 0xfffff; int dup = !own;
+                for (int q = 0; q < k && !dup; q++) dup = (part ? idm_word(st, q) >> 20 : idm_word(st, q) & 0xfffff) == own;
+                if (dup) fr = k; }
+            if (fr < 0) { NRED_ONCE("shader %s reads %s ID %u from storage slot %u, which no slot holds, and every element of its arrays is a slot's own: it reads element 31", sh->key, part ? "sampler" : "texture", x, sh->hs[i].reg); continue; }
+            g[st][fr] = x;
+            { static int nl; if (nl < 8) { nl++; NLOG("shader %s reads %s ID %u from storage slot %u word %u, which no slot holds: element %d (first cases)", sh->key, part ? "sampler" : "texture", x, sh->hs[i].reg, v[0], fr); } }
+        }
+    }
 }
 // A handle read from the stage's uniform slot reg at byte off (TEXU, nvn_mtl.m ubo_handle / ubo_tex_id / ubo_samp_id): the texture ID in its low 20 bits, the sampler ID above,
 // each in the pools bound now. Read from guest memory (an inline update of the buffer within this submission is not seen). Paper Mario: The Thousand-Year Door's deferred
@@ -2618,6 +2657,7 @@ static int nofmt_write_ok(VkFormat fmt) {
 // and their writes are left with no descriptor (descriptorCount 0)
 static int cs_binds(const vkn_shader *sh, VkDescriptorImageInfo *ii, VkDescriptorBufferInfo *bi, VkWriteDescriptorSet *wr, vkn_img **imgs, int *ni, int frag) {
     g_dyn_n = 0;
+    idmap_extra(5, sh->idmap ? sh : NULL);
     for (int i = 0; i < sh->nb; i++) { const vkn_sbind *b = &sh->b[i];
         wr[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, b->binding, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, NULL, NULL};
         if (b->kind == VKN_B_TEX) {
@@ -3019,6 +3059,7 @@ static int op_draw(const op_hdr *h, const uint8_t *a) {
     if (L == &g_lay_bad) return draw_skip(DK_SHADER);
     // Resources before the pass opens (a texture's layout change ends it)
     draw_tex_prep();
+    idmap_extra(1, ps && ps->idmap ? ps : NULL);
     VkDescriptorImageInfo ii[2 * VKN_MAXB]; VkDescriptorBufferInfo bi[2 * VKN_MAXB]; VkWriteDescriptorSet wr[2 * VKN_MAXB]; uint32_t nw = 0; g_dyn_n = 0;
     for (int s = 0; s < 2; s++) { const vkn_shader *sh = s ? ps : vs; if (!sh) continue;
         for (int i = 0; i < sh->nb; i++) { const vkn_sbind *b = &sh->b[i];

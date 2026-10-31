@@ -134,6 +134,7 @@ int vkn_present_drain(uint64_t ns);      // the same within ns: 1 = done
 enum { VKN_B_UBO = 1, VKN_B_C1, VKN_B_ZERO, VKN_B_TEX, VKN_B_SUPPORT, VKN_B_SBUF, VKN_B_IMG, VKN_B_DRV0, VKN_B_TEXD, VKN_B_SAMPD, VKN_B_DRV2, VKN_B_TEXU, VKN_B_UBOP };   // UBOP: uniform slot reg bound as a storage buffer (compute's uniforms as device pointers, nvn_mtl.m NVN_RB_UBOP)   // TEXU: texture handles in a uniform buffer (slot reg, byte off; n > 1: an array, element k at off + 8k)   // TEXD / SAMPD: n textures / samplers picked at run time by slot (tex_dyn_slots); DRV2: driver bank c2 (draw_drv2)   // VKN_B_DRV0: driver bank c0 the shader reads (nvn_vk.c draw_drv0)   // VKN_B_IMG: a storage image, NVN image slot reg (compute)   // also Ryujinx's support_buffer (nvn_vk.c g_supbuf), an NVN storage buffer slot (reg; rw: written). A binding: an NVN uniform slot (reg), the shader's c1 bank, a driver bank it reads nothing of (zeros), a combined texture slot (reg)
 enum { VKN_S_TEX = 1, VKN_S_SAMP, VKN_S_ID };              // its sampler: the sampler half of combined slot sreg, separate sampler slot sreg, the constant sampler ID sreg
 enum { VKN_VT_2D, VKN_VT_2D_ARRAY, VKN_VT_CUBE, VKN_VT_3D };
+enum { VKN_HS_CONST = 1, VKN_HS_UBO, VKN_HS_ADD, VKN_HS_SUB, VKN_HS_MUL, VKN_HS_SHL, VKN_HS_SHR, VKN_HS_SAR, VKN_HS_AND, VKN_HS_OR };   // vkn_shader.hs ops (op, arg pairs): a constant, uniform slot arg >> 16 at byte arg & 0xffff, then binary ops on the top two
 typedef struct { uint8_t kind, skind, vt, comp, set, rw, n; uint16_t orig, binding, reg, sreg, off; } vkn_sbind;   // n: an array binding's length (TEXD, SAMPD)   // binding: in the draws' set (pixel ones + 32); comp 0 float 1 uint 2 sint
 typedef struct vkn_shader {
     char key[17]; int stage;             // NVN stage: 0 vertex, 1 pixel
@@ -146,6 +147,7 @@ typedef struct vkn_shader {
     int dyn;                                          // has TEXD / SAMPD bindings: c2 holds slot indices for it (draw_drv2)
     int bits;                                         // texture reads used only as bits that read a uint image (vk_shader.c spv_bits): their bindings' comp is uint
     int idmap;                                        // TEXD / SAMPD indices looked up in the slots' handles (vk_shader.c spv_idmap): the 32-word push constant table (nvn_vk.c draw_idmap)
+    int nhs; struct { uint16_t reg, n; uint32_t c[32]; } hs[4];   // handles it reads from storage slot reg at a word index made of constants and uniform words: n words of postfix (vk_shader.c spv_hsrc, nvn_vk.c idmap_extra)
     int dual;                                         // a pixel shader with an Output decorated Index other than 0 (dual-source blending's second colour)
     VkBuffer c1_buf; VkDeviceMemory c1_mem; uint32_t c1_n;
     VkDescriptorSetLayout cdsl; VkPipelineLayout cpl; VkPipeline cpso; int cbad;   // a compute shader's own layout and pipeline (nvn_vk.c op_dispatch); cbad: they cannot be made
