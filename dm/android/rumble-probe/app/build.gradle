@@ -1,0 +1,20 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'dev.nxnative.probe'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'dev.nxnative.probe'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+        externalNativeBuild { cmake { cFlags '-std=c11 -Wall -Wextra' } }
+    }
+    externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt' } }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    sourceSets.main.java.srcDirs += ['../../app/java']   // HapticsRouter, beside the host's own activity (left out)
+    sourceSets.main.java.exclude 'org/nxnative/host/**'
+}

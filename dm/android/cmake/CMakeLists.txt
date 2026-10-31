@@ -74,7 +74,9 @@ endif()
 # Nothing may use initial-exec TLS (bionic refuses to dlopen such a library, docs/android/probes-cpu.md P0.2): the __thread variables stay general-dynamic (TLSDESC) under -fPIC.
 # -Bsymbolic: the host's own names bind inside the library, as in the executable (a dlopen'd library is searched after the app's global group, where another library's die or module_of could win);
 # the C library's (sigaction, sigprocmask) stay undefined, so ART's libsigchain still stands in front of them. No text relocations (-z text, lld's default, makes one a link error)
-add_library(dmhost_lib SHARED ${HOST_SRC} "${DM}/android/front/host_main.c" "${DM}/android/front/front_android.c" "${DM}/android/front/hotkey.c")
+# haptics_android.c / haptics_android_jni.c: rumble through the app's HapticsRouter (docs/android/rumble.md); the headless dmhost has no activity, so no output, as before
+add_library(dmhost_lib SHARED ${HOST_SRC} "${DM}/android/front/host_main.c" "${DM}/android/front/front_android.c" "${DM}/android/front/hotkey.c"
+    "${DM}/host/haptics_android.c" "${DM}/host/haptics_android_jni.c")
 set_target_properties(dmhost_lib PROPERTIES OUTPUT_NAME dmhost)
 add_dependencies(dmhost_lib game_profile)
 target_compile_options(dmhost_lib PRIVATE ${DM_CFLAGS})

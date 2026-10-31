@@ -11,6 +11,7 @@
 #include "front.h"
 #include "dm_input.h"
 #include "game_profile.h"   // DM_GAME_ROMFS_MARKER
+#include "haptics_android.h"
 #include <android/asset_manager.h>
 #include <android/input.h>
 #include <android/keycodes.h>
@@ -605,6 +606,32 @@ static void on_focus(ANativeActivity *a, int has) {
     if (!has) input_release();
 }
 
+// ---------- Rumble: HapticsRouter (dm/android/app/java/dev/nxnative/haptics, docs/android/rumble.md), made by HostActivity.startHaptics ----------
+// Started in onCreate before the host thread, so the game's first nn::hid vibration query already sees the output. HapticsRouter's natives are bound here (dm_haptics_android_register: ART
+// does not search a NativeActivity library for exported JNI names), and so is HostActivity.nativeHapticsLog, its lines in log.txt. DM_RUMBLE=0: no router, no output advertised (as before)
+static void JNICALL haptics_log(JNIEnv *env, jclass c, jbyteArray msg) {
+    (void)c;
+    if (!msg) return;
+    char s[2048]; jsize n = (*env)->GetArrayLength(env, msg); if (n > (jsize)sizeof s - 1) n = (jsize)sizeof s - 1;
+    (*env)->GetByteArrayRegion(env, msg, 0, n, (jbyte *)s); s[n] = 0;
+    for (char *l = s, *e; l && *l; l = e) { e = strchr(l, '\n'); if (e) *e++ = 0; fprintf(stderr, "rumble: %s\n", l); }
+}
+static void haptics_init(ANativeActivity *act) {   // onCreate, the UI thread, before the host thread
+    const char *e = getenv("DM_RUMBLE");
+    if (e && !atoi(e)) { fprintf(stderr, "boot: rumble off (DM_RUMBLE=%s): no vibration output is advertised to the game\n", e); return; }
+    JNIEnv *env = act->env; jclass c = (*env)->GetObjectClass(env, act->clazz);
+    jmethodID cls = c ? (*env)->GetStaticMethodID(env, c, "hapticsRouterClass", "()Ljava/lang/Class;") : NULL;
+    jmethodID start = c ? (*env)->GetMethodID(env, c, "startHaptics", "()Z") : NULL;
+    jclass rc = cls && start && !(*env)->ExceptionCheck(env) ? (jclass)(*env)->CallStaticObjectMethod(env, c, cls) : NULL;
+    JNINativeMethod m = { "nativeHapticsLog", "([B)V", (void *)haptics_log };
+    int ok = rc && !(*env)->ExceptionCheck(env) && dm_haptics_android_register(env, rc) && !(*env)->RegisterNatives(env, c, &m, 1);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); ok = 0; }
+    if (ok) { ok = (*env)->CallBooleanMethod(env, act->clazz, start); if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); ok = 0; } }
+    if (rc) (*env)->DeleteLocalRef(env, rc);
+    if (c) (*env)->DeleteLocalRef(env, c);
+    if (!ok) fprintf(stderr, "boot: [RED] rumble did not start (HapticsRouter or its natives could not be bound, or it failed; log.txt's rumble: lines say why): the game sees no vibration output\n");
+}
+
 // ---------- Lifecycle (iOS front_ios_focus_event): paused = focus lost and audio suspended; stopped = in the background, the guest clock frozen and graphics suspended ----------
 // The first onStart / onResume of a launch only begins it: the host starts in focus (hle_oe.c), and pushing 2 then 1 would send the game focus messages while it boots. Main thread only
 static int g_paused, g_stopped;
@@ -636,6 +663,7 @@ void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_si
     if (!boot_env()) return;
     text_box_init(act);
     touch_init(act);
+    haptics_init(act);
     g_input_log = getenv("DM_INPUT_LOG") && atoi(getenv("DM_INPUT_LOG"));   // log each key press with what reached the controller (the done-test's evidence)
     { const char *e = getenv("DM_STICK_DEADZONE"); char *end; float v = e ? strtof(e, &end) : 0;
       if (e && end != e && v >= 0.f && v <= 0.9f) g_dz = v; else if (e) fprintf(stderr, "boot: DM_STICK_DEADZONE=%s is not a fraction from 0 to 0.9: the dead zone stays %.2f\n", e, g_dz); }

@@ -2,16 +2,19 @@
 // touch gamepad (TouchPad, a window of its own over this one).
 // front_text_input (front.h) calls showTextInput on a host-owned thread; the box is an AlertDialog with an EditText, so the system keyboard types into it as into any text field (its committed
 // text, composition and suggestions included), and its answer goes back through nativeTextDone, which front_android.c registers in onCreate. The box keeps OK disabled until the text reaches
-// the game's minimum length, as the Switch applet does (front_mac.m brings its box back instead). Built by build_app.sh (javac, d8) into the APK's classes.dex
+// the game's minimum length, as the Switch applet does (front_mac.m brings its box back instead). Rumble: HapticsRouter (dev.nxnative.haptics), started by front_android.c's onCreate through
+// startHaptics. Built by build_app.sh (javac, d8) into the APK's classes.dex
 package org.nxnative.host;
 
 import android.app.AlertDialog;
 import android.app.NativeActivity;
 import android.content.DialogInterface;
+import android.hardware.input.InputManager;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
@@ -19,6 +22,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.TextView;
+import dev.nxnative.haptics.HapticsRouter;
 import java.nio.charset.StandardCharsets;
 
 public class HostActivity extends NativeActivity {
@@ -107,9 +111,74 @@ public class HostActivity extends NativeActivity {
     @Override public void onWindowFocusChanged(boolean has) {
         super.onWindowFocusChanged(has);
         if (pad != null) pad.focus(has);
+        focused = has; hapticsActive();
     }
     @Override protected void onPause() {
         super.onPause();
         if (pad != null) pad.release();
+        resumed = false; hapticsActive();
+    }
+    @Override protected void onResume() {
+        super.onResume();
+        resumed = true; hapticsActive();
+    }
+    // front_android.c's onDestroy ends the process inside super.onDestroy: the motors stop first
+    @Override protected void onDestroy() {
+        if (haptics != null) { haptics.close(); haptics = null; }
+        super.onDestroy();
+    }
+
+    // ---- Rumble (docs/android/rumble.md): the game's nn::hid vibration through HapticsRouter, to player 1's controller when it has a motor, else the built-in motor ----
+    // front_android.c binds HapticsRouter's natives on hapticsRouterClass (this class loader's), then calls startHaptics, both in onCreate before the host thread starts. nativeHapticsLog: a
+    // line in log.txt (rumble: ...)
+    static native void nativeHapticsLog(byte[] utf8);
+    private HapticsRouter haptics;
+    private int hapticsPlayer1 = -2;   // the input device given as player 1's, -1 none, -2 not yet given
+    private boolean resumed, focused = true, hapticsOn = true;
+    static Class<?> hapticsRouterClass() { return HapticsRouter.class; }
+    private static void hlog(String s) { nativeHapticsLog(s.getBytes(StandardCharsets.UTF_8)); }
+    boolean startHaptics() {
+        try {
+            HapticsRouter h = new HapticsRouter(this);
+            if (!h.start()) { hlog("[RED] HapticsRouter.start failed (the native dispatcher did not start)"); return false; }
+            haptics = h;
+            hapticsPick();
+            getSystemService(InputManager.class).registerInputDeviceListener(new InputManager.InputDeviceListener() {
+                public void onInputDeviceAdded(int id) { hapticsPick(); }
+                public void onInputDeviceRemoved(int id) { hapticsPick(); }
+                public void onInputDeviceChanged(int id) { hapticsPick(); }
+            }, null);
+            hlog(h.capabilities());
+            return true;
+        } catch (Throwable t) {   // never stops the game: it runs without rumble
+            hlog("[RED] rumble could not start: " + t);
+            haptics = null;
+            return false;
+        }
+    }
+    // Every controller is player 1 (front_android.c): the first non-virtual gamepad with a motor drives player 1's rumble; none, and HapticsRouter's Auto mode uses the built-in motor
+    private void hapticsPick() {
+        if (haptics == null) return;
+        int pick = -1; String name = null;
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null || d.isVirtual()) continue;
+            int s = d.getSources();
+            if ((s & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD && (s & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK) continue;
+            if (d.getVibratorManager().getVibratorIds().length == 0) continue;
+            pick = id; name = d.getName(); break;
+        }
+        if (pick == hapticsPlayer1) return;
+        hapticsPlayer1 = pick;
+        haptics.setPlayerInputDevice(0, pick);
+        String r = haptics.capabilities(); int at = r.indexOf("\nPlayer 1: ");
+        hlog("player 1's controller: " + (pick < 0 ? "none with a motor" : "#" + pick + " '" + name + "'") + " → " + (at < 0 ? "?" : r.substring(at + 1, r.indexOf('\n', at + 1) < 0 ? r.length() : r.indexOf('\n', at + 1))));
+    }
+    // Rumble only while resumed and in focus (the input box, the notification shade or another window in front stop it); a game command after that starts it again, nothing is replayed
+    private void hapticsActive() {
+        boolean on = resumed && focused;
+        if (haptics == null || on == hapticsOn) return;
+        hapticsOn = on;
+        if (on) haptics.resume(); else haptics.pause();
     }
 }
