@@ -31,7 +31,9 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
     private static final int INACTIVE = 1;
     private static final int INTERRUPTED = 2;
     public static final int AUTO = 0, BUILTIN = 1, CONTROLLER = 2, OFF = 3;
-    private static final long[] HOLD_MS = { 0, 1000 };
+    // One 1 s step at the strength, repeated until the next change. No leading step at strength 0: an input device's vibrator (InputReader) takes it as a stop, so every strength
+    // change braked a controller's motor before starting it again, and the same rumble felt strong or weak by timing
+    private static final long[] HOLD_MS = { 1000 };
     // Games update vibration every few milliseconds (TTYD: every 5 ms). Each vibrate() restarts the effect, and a Bluetooth controller re-sent one every 5 ms never spins up
     // (felt on an Xbox controller, RG 476H). So at most one vibrate() per SEND_MS, the strength in steps of STEP; a stop goes at once
     private static final long SEND_MS = 40;
@@ -90,7 +92,7 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
             if (amplitude == 0) { cancel(); return; }
             VibrationEffect effect;
             if (this.amplitude) {
-                effect = VibrationEffect.createWaveform(HOLD_MS, new int[]{0, amplitude}, 1);
+                effect = VibrationEffect.createWaveform(HOLD_MS, new int[]{amplitude}, 0);
             } else {
                 // Full-power pulse density is proportional to the requested coarse strength.
                 int on = amplitude >= 255 ? 60 : amplitude >= 96 ? 15 : 5;
@@ -225,7 +227,7 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
     }
     private void send(Route r, int q, long now) {
         r.lastSent = now;
-        if (drops < 64) { drops++; Log.d(TAG, "send " + q + " on " + r.identity + (r.amplitude ? " (amplitude)" : " (binary)")); }
+        if (drops < 4096) { drops++; Log.d(TAG, "send " + q + " on " + r.identity + (r.amplitude ? " (amplitude)" : " (binary)")); }
         try { r.play(q); }
         catch (RuntimeException e) {
             Log.e(TAG, "[RED] vibration output failed on " + r.identity, e);
@@ -233,8 +235,8 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
         }
     }
 
-    private int drops;   // the first 64 drops and plays go to logcat (NxHaptics)
-    private void drop(String why) { if (drops < 64) { drops++; Log.d(TAG, "dropped: " + why); } }
+    private int drops;   // the first 4096 drops and sends go to logcat (NxHaptics)
+    private void drop(String why) { if (drops < 4096) { drops++; Log.d(TAG, "dropped: " + why); } }
 
     private Route builtIn(int token) {
         if (Build.VERSION.SDK_INT >= 31) {
