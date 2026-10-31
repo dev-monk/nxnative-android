@@ -203,13 +203,13 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
         // in the native contract for validated independent actuators on later devices.
         deliver(r, mono);
     }
-    // Under the routing lock. A strength change within SEND_MS of the last send waits for a flush, which sends the latest one
+    // Under the routing lock. A strength change within SEND_MS of the last send waits for a flush, which sends the strongest one since
     private void deliver(Route r, int mono) {
         int q = mono <= 0 ? 0 : r.amplitude ? Math.min(255, Math.max(STEP, (mono + STEP / 2) / STEP * STEP)) : mono;
         if (q == 0) { r.cancel(); return; }
         long now = SystemClock.uptimeMillis();
         if (!r.scheduled && now - r.lastSent >= SEND_MS) { send(r, q, now); return; }
-        r.pending = q;
+        r.pending = Math.max(r.pending, q);   // the strongest of the wait: a peak shorter than SEND_MS (a menu tick) is still felt
         if (r.scheduled || pace == null) return;
         r.scheduled = true;
         final Route route = r;

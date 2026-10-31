@@ -86,6 +86,18 @@ static int amount(float x) {
     return n < 1 ? 1 : n;
 }
 
+// An Android motor's strength: the largest amplitude of the motors' two bands, times gain. dm_haptics_level adds the bands' and motors' power (Core Haptics' phone mix), which
+// reaches full strength at amplitude 0.5 on both bands: TTYD's weak, normal and strong rumble settings (peaks 0.5, 1, 1) all came out at full strength on an Xbox controller
+static float strength(const dm_vibration *v, int n, float gain) {
+    float a = 0;
+    for (int i = 0; i < n; i++) {
+        float lo = isfinite(v[i].amplitude_low) ? v[i].amplitude_low : 0, hi = isfinite(v[i].amplitude_high) ? v[i].amplitude_high : 0;
+        a = fmaxf(a, fmaxf(lo, hi));
+    }
+    a = fminf(1, fmaxf(0, a));
+    return isfinite(gain) && gain > 0 ? fminf(1, a * gain) : 0;
+}
+
 static void *run(void *unused) {
     (void)unused;
     for (;;) {
@@ -106,12 +118,10 @@ static void *run(void *unused) {
         // Do not hold mu while acquiring the haptics engine mutex: sink uses the opposite order.
         if (!r.available || e.route_generation != r.generation ||
             e.state.epoch != dm_haptics_epoch(e.state.player)) continue;
-        dm_haptic_level left = dm_haptics_level(e.state.motor, 1, g);
-        dm_haptic_level right = dm_haptics_level(e.state.motor + 1, 1, g);
-        dm_haptic_level both = dm_haptics_level(e.state.motor, 2, g);
+        float left = strength(e.state.motor, 1, g), right = strength(e.state.motor + 1, 1, g);
         // Serialized callback. Android checks the route token again under its routing lock.
         output(opaque, e.state.player, e.route_token, e.state.epoch,
-               amount(left.intensity), amount(right.intensity), amount(both.intensity));
+               amount(left), amount(right), amount(fmaxf(left, right)));
     }
     return NULL;
 }
