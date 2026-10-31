@@ -21,6 +21,15 @@ The NativeActivity loads `libdmhost.so` itself, not through `System.loadLibrary`
 
 All controllers are merged into player 1 (`front_android.c`). `HostActivity.hapticsPick` gives player 1 the first non-virtual gamepad or joystick that has a vibrator. If there is none, it passes `-1`, and Auto mode falls back to the built-in motor. Players 2 to 8 get no output. The router never sends one output to two players.
 
+## Send pacing
+
+Games update vibration every few milliseconds (TTYD: every 5 ms). Each `vibrate()` restarts the effect, and an Xbox controller over Bluetooth that got a new one every 5 ms never rumbled. The router therefore sends at most one `vibrate()` per 40 ms:
+- Strength goes in steps of 32.
+- The strongest value seen while waiting is the one sent.
+- A stop goes out at once.
+
+Each Android motor's strength is the largest amplitude across its bands, times the gain. The phone mix in `dm_haptics_level` saturates at amplitude 0.5.
+
 ## Switches and log
 
 - `DM_RUMBLE=0` in `env.txt`: no router is started, and the game sees no vibration output (as before this change).
@@ -28,11 +37,14 @@ All controllers are merged into player 1 (`front_android.c`). `HostActivity.hapt
   - at start, the capability report: SDK, build, mode and strength, built-in vibrator IDs with amplitude support, gamepads with their motors, and each player's route;
   - `player 1's controller: ... → Player 1: built-in, amplitude` (or `controller #N, ...`) on each change.
 - `boot: [RED] rumble did not start` when binding or start failed. The game then runs without rumble.
-- Router errors go to logcat under the tag `NxHaptics`.
+- `DM_RUMBLE_LOG=1`: logs what the game sends (`hle_hid.c`) and what reaches the router (`haptics_android_jni.c`).
+- logcat, tag `NxHaptics`: router errors, plus the first 4096 sends and drops.
+- `files/rumble_test` present in the app's data: three test buzzes on player 1, three seconds after start.
 
 ## Not done yet
 
 - There is no in-app menu for the router's mode, on/off or strength. The methods `setOutputMode`, `setEnabled` and `setStrength` exist and persist their values, but nothing in the UI calls them yet.
+- On the RG 476H (GammaOS, Android 14) with an Xbox Wireless Controller over Bluetooth, rumble works but every strength feels the same. TTYD's weak, normal and strong settings reach the controller as three distinct patterns, the same on every press (weak peaks at 128; normal is 255 for 40 ms; strong is 255 for about 120 ms). The controller path below Android's vibrator API, the Bluetooth driver or the firmware, does not reproduce the strength. Not pursued.
 - Output is a mono amplitude approximation, not Switch HD rumble frequency and not separate left and right motors.
 - There is no kernel `FF_RUMBLE` path. A motor that is not exposed through the public vibrator API shows as unavailable.
 
