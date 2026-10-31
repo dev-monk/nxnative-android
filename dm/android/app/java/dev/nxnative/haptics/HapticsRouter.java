@@ -6,6 +6,9 @@ import android.content.SharedPreferences;
 import android.hardware.input.InputManager;
 import android.media.AudioAttributes;
 import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.os.CombinedVibration;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
@@ -29,6 +32,12 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
     private static final int INTERRUPTED = 2;
     public static final int AUTO = 0, BUILTIN = 1, CONTROLLER = 2, OFF = 3;
     private static final long[] HOLD_MS = { 0, 1000 };
+    // Games update vibration every few milliseconds (TTYD: every 5 ms). Each vibrate() restarts the effect, and a Bluetooth controller re-sent one every 5 ms never spins up
+    // (felt on an Xbox controller, RG 476H). So at most one vibrate() per SEND_MS, the strength in steps of STEP; a stop goes at once
+    private static final long SEND_MS = 40;
+    private static final int STEP = 32;
+    private HandlerThread pacer;
+    private Handler pace;
     private static final AudioAttributes AUDIO = new AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_GAME).build();
 
@@ -49,6 +58,10 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
         final boolean amplitude;
         int lastAmplitude = -1;
         long lastEpoch;
+        // Send pacing (deliver): the latest strength waiting for its turn, -1 none; when the last one went out; whether a flush is posted
+        int pending = -1;
+        long lastSent = -SEND_MS;
+        boolean scheduled;
         Route(int token, int deviceId, String identity, VibratorManager manager,
               Vibrator vibrator, boolean amplitude) {
             this.token = token;
@@ -66,6 +79,7 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
                 Log.w(TAG, "Vibrator cancellation failed", error);
             }
             lastAmplitude = 0;
+            pending = -1;
         }
         void play(int requested) {
             // A binary device must not turn tiny amplitude requests into 100% continuous buzz.
@@ -118,6 +132,9 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
         boolean permitted = app.getPackageManager().checkPermission(
                 android.Manifest.permission.VIBRATE, app.getPackageName()) == PackageManager.PERMISSION_GRANTED;
         if (!nativeStart(this, permitted)) return false;
+        pacer = new HandlerThread("rumble-pace");
+        pacer.start();
+        pace = new Handler(pacer.getLooper());
         synchronized (this) { started = true; }
         if (input != null) input.registerInputDeviceListener(this, null);
         refresh();
@@ -172,21 +189,52 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
     @SuppressWarnings("unused")
     private synchronized void applyFromNative(int player, int token, long epoch,
                                               int left, int right, int mono) {
-        if (closed || paused || interrupted || !enabled || player < 0 || player >= PLAYERS) return;
+        if (closed || paused || interrupted || !enabled || player < 0 || player >= PLAYERS) {
+            drop("closed=" + closed + " paused=" + paused + " interrupted=" + interrupted + " enabled=" + enabled + " player=" + player);
+            return;
+        }
         Route r = routes[player];
         // A queued STOP for a previous token may not cancel an entirely new output.
-        if (r == null || r.token != token) return;
+        if (r == null || r.token != token) { drop("route " + (r == null ? "none" : "token " + r.token) + ", delivery for token " + token); return; }
         if (epoch == 0 && left == 0 && right == 0 && mono == 0) { r.cancel(); return; }
         if (epoch < r.lastEpoch) return;
         if (epoch > r.lastEpoch) { r.cancel(); r.lastEpoch = epoch; }
         // Android 14 baseline: mono amplitude approximation. Left and right are retained
         // in the native contract for validated independent actuators on later devices.
-        try { r.play(mono); }
+        deliver(r, mono);
+    }
+    // Under the routing lock. A strength change within SEND_MS of the last send waits for a flush, which sends the latest one
+    private void deliver(Route r, int mono) {
+        int q = mono <= 0 ? 0 : r.amplitude ? Math.min(255, Math.max(STEP, (mono + STEP / 2) / STEP * STEP)) : mono;
+        if (q == 0) { r.cancel(); return; }
+        long now = SystemClock.uptimeMillis();
+        if (!r.scheduled && now - r.lastSent >= SEND_MS) { send(r, q, now); return; }
+        r.pending = q;
+        if (r.scheduled || pace == null) return;
+        r.scheduled = true;
+        final Route route = r;
+        pace.postAtTime(new Runnable() { public void run() { flush(route); } }, r.lastSent + SEND_MS);
+    }
+    private synchronized void flush(Route r) {
+        r.scheduled = false;
+        int q = r.pending; r.pending = -1;
+        boolean current = false;
+        for (Route x : routes) if (x == r) current = true;
+        if (q < 0 || !current || closed || paused || interrupted || !enabled) return;
+        send(r, q, SystemClock.uptimeMillis());
+    }
+    private void send(Route r, int q, long now) {
+        r.lastSent = now;
+        if (drops < 64) { drops++; Log.d(TAG, "send " + q + " on " + r.identity + (r.amplitude ? " (amplitude)" : " (binary)")); }
+        try { r.play(q); }
         catch (RuntimeException e) {
-            Log.e(TAG, "[RED] vibration output failed for player " + player, e);
+            Log.e(TAG, "[RED] vibration output failed on " + r.identity, e);
             r.cancel();
         }
     }
+
+    private int drops;   // the first 64 drops and plays go to logcat (NxHaptics)
+    private void drop(String why) { if (drops < 64) { drops++; Log.d(TAG, "dropped: " + why); } }
 
     private Route builtIn(int token) {
         if (Build.VERSION.SDK_INT >= 31) {
@@ -248,6 +296,30 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
             nativeRoute(p, next != null ? next.token : 0, next != null);
         }
     }
+    /** Diagnostic: three buzzes on player's route, 1.5 s apart (a one-shot at the default strength; one held waveform at full strength; the waveform re-sent every 5 ms as the
+     *  game does). Runs on its own thread; each step goes to out. */
+    public void selfTest(final int player, final java.util.function.Consumer<String> out) {
+        new Thread(new Runnable() { public void run() {
+            try {
+                Thread.sleep(3000);
+                Route r; synchronized (HapticsRouter.this) { r = routes[player]; }
+                if (r == null) { out.accept("self-test: player " + (player + 1) + " has no route"); return; }
+                out.accept("self-test 1/3: one-shot 800 ms, default strength, on " + r.identity);
+                VibrationEffect one = VibrationEffect.createOneShot(800, VibrationEffect.DEFAULT_AMPLITUDE);
+                if (r.manager != null) r.manager.vibrate(CombinedVibration.createParallel(one)); else r.vibrator.vibrate(one);
+                Thread.sleep(1500); r.cancel();
+                out.accept("self-test 2/3: the router's held waveform at 255 for 800 ms");
+                synchronized (HapticsRouter.this) { r.lastAmplitude = -1; r.play(255); }
+                Thread.sleep(800); synchronized (HapticsRouter.this) { r.cancel(); }
+                Thread.sleep(700);
+                out.accept("self-test 3/3: a strength every 5 ms for 800 ms, 255 falling to 100, as the game sends, through the send pacing");
+                for (int i = 0; i < 160; i++) { synchronized (HapticsRouter.this) { deliver(r, 255 - i); } Thread.sleep(5); }
+                synchronized (HapticsRouter.this) { r.cancel(); }
+                out.accept("self-test done");
+            } catch (Throwable t) { out.accept("self-test failed: " + t); }
+        } }, "rumble-selftest").start();
+    }
+
     public synchronized String capabilities() {
         StringBuilder out = new StringBuilder("Android SDK ").append(Build.VERSION.SDK_INT);
         out.append("\nBuild: ").append(Build.DISPLAY);
@@ -303,6 +375,7 @@ public final class HapticsRouter implements InputManager.InputDeviceListener, Au
             }
         }
         if (input != null && started) input.unregisterInputDeviceListener(this);
+        if (pacer != null) pacer.quitSafely();
         // The Java routing lock is released before nativeStop joins the JNI worker.
         if (started) nativeStop();
     }

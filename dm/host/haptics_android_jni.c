@@ -7,6 +7,8 @@
 #include <jni.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static JavaVM *vm;
 static jobject router;
@@ -30,6 +32,11 @@ static void output(void *unused, int player, int token, uint64_t epoch,
         pthread_once(&once, make_key);
         pthread_setspecific(attachment, (void *)1);
     } else if (!env) return;
+    // DM_RUMBLE_LOG: what goes to the router (the first 64 calls, then every 64th), in log.txt beside hle_hid.c's rumble: lines
+    static unsigned calls; static int log = -1;
+    if (log < 0) log = getenv("DM_RUMBLE_LOG") && atoi(getenv("DM_RUMBLE_LOG"));
+    if (log && (++calls <= 64 || calls % 64 == 0))
+        fprintf(stderr, "rumble: to the router (call %u): player %d route %d epoch %llu left %d right %d mono %d\n", calls, player, token, (unsigned long long)epoch, left, right, mono);
     (*env)->CallVoidMethod(env, router, deliver, (jint)player, (jint)token,
                            (jlong)epoch, (jint)left, (jint)right, (jint)mono);
     // Never leave a pending exception on an attached native thread.

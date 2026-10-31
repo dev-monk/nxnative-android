@@ -149,6 +149,8 @@ public class HostActivity extends NativeActivity {
                 public void onInputDeviceChanged(int id) { hapticsPick(); }
             }, null);
             hlog(h.capabilities());
+            if (new java.io.File(getFilesDir(), "rumble_test").exists())   // diagnostic: files/rumble_test present, three buzzes on player 1 three seconds after start
+                h.selfTest(0, new java.util.function.Consumer<String>() { public void accept(String l) { hlog(l); } });
             return true;
         } catch (Throwable t) {   // never stops the game: it runs without rumble
             hlog("[RED] rumble could not start: " + t);
